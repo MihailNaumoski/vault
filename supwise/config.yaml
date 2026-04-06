@@ -1,0 +1,74 @@
+# Supwise Multi-Team Agentic Coding Configuration
+# ERP platform for We Supply Yachts — NestJS 11 + Next.js 16 + Prisma 6 + Supabase
+
+project:
+  name: SUPWISE
+  root: /Users/mihail/projects/SUPWISE
+  stack:
+    backend: NestJS 11 + TypeScript
+    frontend: Next.js 16 + React 19 + Tailwind CSS 4 + shadcn/ui
+    database: PostgreSQL 15+ (Supabase hosted)
+    orm: Prisma 6
+    auth: Supabase Auth (JWT + TOTP 2FA)
+    testing: Playwright (API + E2E)
+    build: pnpm 9 + Turborepo + Docker
+  phases: 7  # 0-6 + extra
+
+orchestrator:
+  system_prompt: ./agents/orchestrator.md
+
+teams:
+  planning:
+    color: "#4A90D9"
+    lead:
+      name: Planning Lead
+      system_prompt: ./agents/planning/lead.md
+    members:
+      - name: Architect
+        system_prompt: ./agents/planning/architect.md
+      - name: Prompt Engineer
+        system_prompt: ./agents/planning/prompt-engineer.md
+
+  engineering:
+    color: "#50C878"
+    lead:
+      name: Engineering Lead
+      system_prompt: ./agents/engineering/lead.md
+    members:
+      - name: Backend Dev
+        system_prompt: ./agents/engineering/backend-dev.md
+      - name: Frontend Dev
+        system_prompt: ./agents/engineering/frontend-dev.md
+
+  validation:
+    color: "#E8633E"
+    lead:
+      name: Validation Lead
+      system_prompt: ./agents/validation/lead.md
+    members:
+      - name: QA Engineer
+        system_prompt: ./agents/validation/qa-engineer.md
+      - name: Security Reviewer
+        system_prompt: ./agents/validation/security-reviewer.md
+
+model_tiers:
+  orchestration: opus:xhigh    # routing, synthesis, cost decisions
+  leadership: opus:xhigh       # quality review, delegation, judgment
+  execution: sonnet:high        # code, tests, analysis
+  lightweight: haiku            # status checks, simple reads
+
+paths:
+  agents: ./agents
+  skills: ./skills
+  prompts: ./prompts
+  templates: ./templates
+  commands: ./commands
+  sessions: ./sessions
+  project_specs: /Users/mihail/projects/SUPWISE/docs/v1
+  project_phases: /Users/mihail/projects/SUPWISE/docs/v1/phases
+  project_claude: /Users/mihail/projects/SUPWISE/.claude
+
+budget:
+  default_phase: 50000      # token budget per phase step
+  max_remediation_rounds: 3  # fix cycles before escalating to user
+  max_agents_per_prompt: 4   # hard cap on parallel agents

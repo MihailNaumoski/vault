@@ -1,0 +1,22 @@
+# Build artifacts
+**/target/
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+credentials*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Obsidian local config
+.obsidian/
+
+# Claude Code local state (user-specific, not project config)
+.claude/projects/
+
+# Session logs (large, ephemeral)
+multi-team/sessions/*.jsonl

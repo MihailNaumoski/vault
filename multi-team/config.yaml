@@ -1,0 +1,64 @@
+# Multi-Team Agentic Coding Configuration
+
+orchestrator:
+  system_prompt: ./agents/orchestrator.md
+
+# Standalone utility agents (orchestrator-level, not part of any team)
+utilities:
+  - name: Context Loader
+    system_prompt: ./agents/context-loader.md
+
+teams:
+  planning:
+    color: "#4A90D9"
+    lead:
+      name: Planning Lead
+      system_prompt: ./agents/planning/lead.md
+    members:
+      - name: Architect
+        system_prompt: ./agents/planning/architect.md
+      - name: Spec Writer
+        system_prompt: ./agents/planning/spec-writer.md
+
+  research:
+    color: "#F5A623"
+    lead:
+      name: Research Lead
+      system_prompt: ./agents/research/lead.md
+    members:
+      - name: Doc Researcher
+        system_prompt: ./agents/research/doc-researcher.md
+      - name: SDK Analyst
+        system_prompt: ./agents/research/sdk-analyst.md
+
+  engineering:
+    color: "#50C878"
+    lead:
+      name: Engineering Lead
+      system_prompt: ./agents/engineering/lead.md
+    members:
+      - name: Backend Dev
+        system_prompt: ./agents/engineering/backend-dev.md
+      - name: Frontend Dev
+        system_prompt: ./agents/engineering/frontend-dev.md
+      - name: Playwright Tester
+        system_prompt: ./agents/engineering/playwright-tester.md
+      - name: Code Reviewer
+        system_prompt: ./agents/engineering/code-reviewer.md
+
+  validation:
+    color: "#E8633E"
+    lead:
+      name: Validation Lead
+      system_prompt: ./agents/validation/lead.md
+    members:
+      - name: QA Engineer
+        system_prompt: ./agents/validation/qa-engineer.md
+      - name: Security Reviewer
+        system_prompt: ./agents/validation/security-reviewer.md
+
+paths:
+  agents: ./agents
+  sessions: ./sessions
+  logs: ./logs
+  phases: ./phases
