@@ -1,0 +1,32 @@
+[package]
+name = "arb-engine"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+mock = ["arb-polymarket/mock", "arb-kalshi/mock"]
+
+[dependencies]
+arb-types = { workspace = true }
+arb-db = { workspace = true }
+arb-risk = { workspace = true }
+arb-matcher = { workspace = true }
+arb-polymarket = { workspace = true }
+arb-kalshi = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+arb-polymarket = { workspace = true, features = ["mock"] }
+arb-kalshi = { workspace = true, features = ["mock"] }

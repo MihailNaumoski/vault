@@ -1,0 +1,38 @@
+[engine]
+enabled = true
+scan_interval_ms = 1000
+min_spread_pct = "3.0"
+min_spread_absolute = "0.02"
+
+[orders]
+max_order_age_secs = 30
+max_hedge_wait_secs = 60
+order_check_interval_ms = 500
+min_repost_spread = "0.02"
+price_improve_amount = "0.01"
+default_quantity = 50
+
+[risk]
+max_position_per_market = "1000.00"
+max_total_exposure = "10000.00"
+max_unhedged_exposure = "500.00"
+max_daily_loss = "200.00"
+min_time_to_close_hours = 1
+min_book_depth = 0
+max_unwind_rate_pct = "20.0"
+
+[polymarket]
+clob_url = "https://clob.polymarket.com"
+gamma_url = "https://gamma-api.polymarket.com"
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+[kalshi]
+api_url = "https://trading-api.kalshi.com/trade-api/v2"
+ws_url = "wss://trading-api.kalshi.com/trade-api/ws/v2"
+
+[database]
+path = "data/arb.db"
+
+[logging]
+level = "info"
+format = "pretty"

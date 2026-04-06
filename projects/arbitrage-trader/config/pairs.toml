@@ -1,0 +1,15 @@
+# Manually configured market pairs.
+#
+# Add pairs here to bypass the automatic matcher. Each [[pairs]] entry
+# must include full platform identifiers so the engine can subscribe to
+# price feeds immediately.
+#
+# Example:
+#
+# [[pairs]]
+# poly_condition_id = "0x..."
+# poly_yes_token_id = "12345"
+# poly_no_token_id  = "12346"
+# poly_question     = "Will Bitcoin hit $100k by Dec 2025?"
+# kalshi_ticker     = "BTC-100K-DEC25"
+# kalshi_question   = "Bitcoin above $100,000 on December 31?"

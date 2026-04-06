@@ -1,0 +1,13 @@
+[package]
+name = "arb-risk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arb-types = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }

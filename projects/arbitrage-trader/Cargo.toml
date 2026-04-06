@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arb-types",
+    "crates/arb-polymarket",
+    "crates/arb-kalshi",
+    "crates/arb-matcher",
+    "crates/arb-engine",
+    "crates/arb-risk",
+    "crates/arb-db",
+    "crates/arb-cli",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.44", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rust_decimal_macros = "1.36"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2.0"
+anyhow = "1.0"
+uuid = { version = "1.11", features = ["v7", "serde"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "json"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rsa = "0.9"
+alloy-signer = "1.5"
+alloy-signer-local = "1.5"
+alloy-primitives = "1.5"
+alloy-sol-types = "1.5"
+dashmap = "6.1"
+config = { version = "0.15", features = ["toml"] }
+dotenvy = "0.15"
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+parking_lot = "0.12"
+strsim = "0.11"
+toml = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4.5", features = ["derive"] }
+governor = "0.8"
+rand = "0.8"
+
+arb-types       = { path = "crates/arb-types" }
+arb-polymarket  = { path = "crates/arb-polymarket" }
+arb-kalshi      = { path = "crates/arb-kalshi" }
+arb-matcher     = { path = "crates/arb-matcher" }
+arb-engine      = { path = "crates/arb-engine" }
+arb-risk        = { path = "crates/arb-risk" }
+arb-db          = { path = "crates/arb-db" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
