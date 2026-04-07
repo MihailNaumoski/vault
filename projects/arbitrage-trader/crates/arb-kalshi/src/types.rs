@@ -16,11 +16,11 @@ pub struct KalshiConfig {
 }
 
 fn default_base_url() -> String {
-    "https://api.elections.kalshi.com/trade-api/v2".to_string()
+    "https://trading-api.kalshi.com/trade-api/v2".to_string()
 }
 
 fn default_ws_url() -> String {
-    "wss://api.elections.kalshi.com/trade-api/ws/v2".to_string()
+    "wss://trading-api.kalshi.com/trade-api/ws/v2".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -394,8 +394,8 @@ mod tests {
             "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"
         }"#;
         let config: KalshiConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.base_url, "https://api.elections.kalshi.com/trade-api/v2");
-        assert_eq!(config.ws_url, "wss://api.elections.kalshi.com/trade-api/ws/v2");
+        assert_eq!(config.base_url, "https://trading-api.kalshi.com/trade-api/v2");
+        assert_eq!(config.ws_url, "wss://trading-api.kalshi.com/trade-api/ws/v2");
     }
 
     #[test]

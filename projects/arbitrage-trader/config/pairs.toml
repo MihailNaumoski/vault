@@ -4,12 +4,43 @@
 # must include full platform identifiers so the engine can subscribe to
 # price feeds immediately.
 #
-# Example:
-#
-# [[pairs]]
-# poly_condition_id = "0x..."
-# poly_yes_token_id = "12345"
-# poly_no_token_id  = "12346"
-# poly_question     = "Will Bitcoin hit $100k by Dec 2025?"
-# kalshi_ticker     = "BTC-100K-DEC25"
-# kalshi_question   = "Bitcoin above $100,000 on December 31?"
+# NOTE: The pairs below are examples with plausible format but placeholder IDs.
+# Replace poly_condition_id, poly_yes_token_id, and poly_no_token_id with
+# real values from the Polymarket Gamma API before production use.
+# Kalshi tickers must match active event tickers on kalshi.com.
+
+# --- US Presidential Election 2028 ---
+[[pairs]]
+poly_condition_id = "0xbd31277a68be28bfc1f2a0defab48205a0dbf4930adf1f0db03e9f24656b5a17"
+poly_yes_token_id = "48129745203981567234"
+poly_no_token_id  = "48129745203981567235"
+poly_question     = "Will a Democrat win the 2028 US Presidential Election?"
+kalshi_ticker     = "PRES-2028-DEM"
+kalshi_question   = "Will a Democrat win the 2028 presidential election?"
+
+# --- Federal Reserve Rate Decision ---
+[[pairs]]
+poly_condition_id = "0xa4e0c4f7e29b3d5a8f1c6d2e0b9a7f3c5d8e1b4a6f2c9d0e3b7a5f8c1d4e6b9"
+poly_yes_token_id = "73928461503827194056"
+poly_no_token_id  = "73928461503827194057"
+poly_question     = "Will the Fed cut rates at the June 2026 FOMC meeting?"
+kalshi_ticker     = "FED-RATE-26JUN"
+kalshi_question   = "Will the Fed cut interest rates at the June 2026 meeting?"
+
+# --- US GDP Growth ---
+[[pairs]]
+poly_condition_id = "0xc7d2e8f1a3b5c9d0e4f6a2b8c1d5e7f3a9b0c4d6e2f8a1b3c5d7e9f0a2b4c6"
+poly_yes_token_id = "91537284061948273501"
+poly_no_token_id  = "91537284061948273502"
+poly_question     = "Will US GDP growth exceed 3% in Q2 2026?"
+kalshi_ticker     = "GDP-2026-Q2-3"
+kalshi_question   = "US GDP growth above 3.0% in Q2 2026?"
+
+# --- S&P 500 Year-End Target ---
+[[pairs]]
+poly_condition_id = "0xe1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1"
+poly_yes_token_id = "60284719385016294738"
+poly_no_token_id  = "60284719385016294739"
+poly_question     = "Will the S&P 500 close above 6,000 on Dec 31, 2026?"
+kalshi_ticker     = "INX-2026-6000"
+kalshi_question   = "S&P 500 above 6,000 at year-end 2026?"

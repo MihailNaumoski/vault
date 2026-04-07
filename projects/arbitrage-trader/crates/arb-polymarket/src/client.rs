@@ -21,8 +21,9 @@ pub struct PolymarketClient {
 impl PolymarketClient {
     /// Create a new client from configuration.
     pub fn new(config: PolyConfig) -> Result<Self, PolymarketError> {
-        let auth = PolyAuth::new(config.api_key, config.secret, config.passphrase)?;
         let signer = OrderSigner::new(&config.private_key, config.chain_id)?;
+        let wallet_address = format!("{:?}", signer.address()); // checksummed hex
+        let auth = PolyAuth::new(config.api_key, config.secret, config.passphrase, wallet_address)?;
         let http = reqwest::Client::builder()
             .build()
             .map_err(PolymarketError::Http)?;
@@ -119,11 +120,12 @@ impl PolymarketClient {
         &self,
         req: &arb_types::LimitOrderRequest,
         token_id: &str,
+        neg_risk: bool,
     ) -> Result<PolyOrderResponse, PolymarketError> {
         self.rate_limiter.acquire().await;
 
         let path = "/order";
-        let signed_body = self.signer.sign_order(req, token_id).await?;
+        let signed_body = self.signer.sign_order(req, token_id, neg_risk).await?;
         let body_str = serde_json::to_string(&signed_body)?;
         let auth_headers = self.auth.headers("POST", path, &body_str)?;
 

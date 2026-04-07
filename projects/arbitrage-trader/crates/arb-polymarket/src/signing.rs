@@ -8,6 +8,9 @@ use crate::error::PolymarketError;
 /// Polymarket CTF Exchange address on Polygon.
 pub const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 
+/// Polymarket NegRisk CTF Exchange address on Polygon (for neg-risk markets).
+pub const NEG_RISK_CTF_EXCHANGE_ADDRESS: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+
 // EIP-712 typed data struct matching Polymarket's CTF Exchange contract.
 sol! {
     #[derive(Debug)]
@@ -66,6 +69,7 @@ impl OrderSigner {
         &self,
         req: &arb_types::LimitOrderRequest,
         token_id: &str,
+        neg_risk: bool,
     ) -> Result<serde_json::Value, PolymarketError> {
         let maker = self.signer.address();
 
@@ -124,11 +128,18 @@ impl OrderSigner {
             signatureType: 0, // EOA
         };
 
+        let verifying_contract = if neg_risk {
+            NEG_RISK_CTF_EXCHANGE_ADDRESS
+                .parse::<Address>()
+                .map_err(|e| PolymarketError::Signing(format!("invalid neg-risk contract address: {e}")))?        } else {
+            self.verifying_contract
+        };
+
         let domain = eip712_domain! {
             name: "Polymarket CTF Exchange",
             version: "1",
             chain_id: self.chain_id,
-            verifying_contract: self.verifying_contract,
+            verifying_contract: verifying_contract,
         };
 
         let hash = order.eip712_signing_hash(&domain);
@@ -192,7 +203,7 @@ mod tests {
             quantity: 100,
         };
 
-        let body = signer.sign_order(&req, "12345").await.unwrap();
+        let body = signer.sign_order(&req, "12345", false).await.unwrap();
 
         // Verify JSON structure
         assert!(body.get("order").is_some());
@@ -225,7 +236,7 @@ mod tests {
             price: dec!(0.50),
             quantity: 10,
         };
-        let body_yes = signer.sign_order(&req_yes, "1").await.unwrap();
+        let body_yes = signer.sign_order(&req_yes, "1", false).await.unwrap();
         assert_eq!(body_yes["order"]["side"].as_str().unwrap(), "0");
 
         let req_no = arb_types::LimitOrderRequest {
@@ -234,7 +245,7 @@ mod tests {
             price: dec!(0.50),
             quantity: 10,
         };
-        let body_no = signer.sign_order(&req_no, "1").await.unwrap();
+        let body_no = signer.sign_order(&req_no, "1", false).await.unwrap();
         assert_eq!(body_no["order"]["side"].as_str().unwrap(), "1");
     }
 
@@ -250,7 +261,7 @@ mod tests {
             price: dec!(0.50),
             quantity: 100,
         };
-        let body = signer.sign_order(&req, "1").await.unwrap();
+        let body = signer.sign_order(&req, "1", false).await.unwrap();
         let maker_amount: u64 = body["order"]["makerAmount"]
             .as_str()
             .unwrap()
@@ -277,7 +288,7 @@ mod tests {
             price: dec!(0.80),
             quantity: 50,
         };
-        let body = signer.sign_order(&req, "1").await.unwrap();
+        let body = signer.sign_order(&req, "1", false).await.unwrap();
         let maker_amount: u64 = body["order"]["makerAmount"]
             .as_str()
             .unwrap()
@@ -290,6 +301,27 @@ mod tests {
             .unwrap();
         assert_eq!(maker_amount, 50_000_000);
         assert_eq!(taker_amount, 40_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_sign_order_neg_risk_uses_different_contract() {
+        let signer = OrderSigner::new(TEST_PRIVATE_KEY, 137).unwrap();
+        let req = arb_types::LimitOrderRequest {
+            market_id: "m".to_string(),
+            side: arb_types::Side::Yes,
+            price: dec!(0.50),
+            quantity: 10,
+        };
+        let body_normal = signer.sign_order(&req, "1", false).await.unwrap();
+        let body_neg = signer.sign_order(&req, "1", true).await.unwrap();
+        // Both should produce valid JSON with different signatures (different domain)
+        assert!(body_normal.get("signature").is_some());
+        assert!(body_neg.get("signature").is_some());
+        // Signatures should differ because the EIP-712 domain is different
+        assert_ne!(
+            body_normal["signature"].as_str().unwrap(),
+            body_neg["signature"].as_str().unwrap()
+        );
     }
 
     #[test]

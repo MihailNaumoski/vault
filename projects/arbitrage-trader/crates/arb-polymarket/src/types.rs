@@ -89,6 +89,8 @@ pub struct PolyMarketResponse {
     pub market_slug: Option<String>,
     #[serde(default)]
     pub clob_token_ids: Option<String>,
+    #[serde(default)]
+    pub neg_risk: Option<bool>,
 }
 
 /// Token within a PolyMarketResponse.
@@ -475,6 +477,7 @@ mod tests {
             end_date_iso: None,
             market_slug: None,
             clob_token_ids: None,
+            neg_risk: None,
         }
     }
 

@@ -12,6 +12,7 @@ pub struct PolyAuth {
     api_key: String,
     secret: Vec<u8>, // base64-decoded secret
     passphrase: String,
+    wallet_address: String,
 }
 
 impl PolyAuth {
@@ -22,6 +23,7 @@ impl PolyAuth {
         api_key: String,
         secret_b64: String,
         passphrase: String,
+        wallet_address: String,
     ) -> Result<Self, PolymarketError> {
         let secret = STANDARD
             .decode(&secret_b64)
@@ -30,6 +32,7 @@ impl PolyAuth {
             api_key,
             secret,
             passphrase,
+            wallet_address,
         })
     }
 
@@ -89,6 +92,11 @@ impl PolyAuth {
             HeaderValue::from_str(&self.passphrase)
                 .map_err(|e| PolymarketError::Auth(format!("invalid passphrase header value: {e}")))?,
         );
+        map.insert(
+            HeaderName::from_static("poly_address"),
+            HeaderValue::from_str(&self.wallet_address)
+                .map_err(|e| PolymarketError::Auth(format!("invalid wallet_address header value: {e}")))?,
+        );
         Ok(map)
     }
 }
@@ -104,6 +112,7 @@ mod tests {
             "test-api-key".to_string(),
             secret_b64,
             "test-passphrase".to_string(),
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string(),
         )
         .unwrap()
     }
@@ -150,10 +159,28 @@ mod tests {
         assert!(headers.contains_key("poly_signature"));
         assert!(headers.contains_key("poly_timestamp"));
         assert!(headers.contains_key("poly_passphrase"));
-        assert_eq!(headers.len(), 4);
+        assert!(headers.contains_key("poly_address"));
+        assert_eq!(headers.len(), 5);
 
         assert_eq!(headers["poly_api_key"], "test-api-key");
         assert_eq!(headers["poly_passphrase"], "test-passphrase");
+        assert_eq!(headers["poly_address"], "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+    }
+
+    #[test]
+    fn test_headers_includes_poly_address() {
+        let secret_b64 = STANDARD.encode(b"test-secret-key-1234");
+        let wallet = "0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF".to_string();
+        let auth = PolyAuth::new(
+            "key".to_string(),
+            secret_b64,
+            "pass".to_string(),
+            wallet.clone(),
+        )
+        .unwrap();
+        let headers = auth.headers("GET", "/test", "").unwrap();
+        assert!(headers.contains_key("poly_address"));
+        assert_eq!(headers["poly_address"], wallet.as_str());
     }
 
     #[test]

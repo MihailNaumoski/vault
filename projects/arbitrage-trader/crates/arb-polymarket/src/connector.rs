@@ -125,7 +125,7 @@ impl PredictionMarketConnector for PolymarketConnector {
         let token_id = &req.market_id;
         let resp = self
             .client
-            .post_order(req, token_id)
+            .post_order(req, token_id, false)
             .await
             .map_err(ArbError::from)?;
         Ok(resp.to_order_response())
@@ -207,6 +207,7 @@ mod tests {
             end_date_iso: None,
             market_slug: None,
             clob_token_ids: None,
+            neg_risk: None,
         };
 
         let market = poly_market.to_market();

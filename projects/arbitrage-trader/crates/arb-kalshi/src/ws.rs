@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -398,9 +399,91 @@ pub(crate) fn ws_message_to_price_update(msg: &KalshiWsMessage) -> Option<PriceU
                 timestamp: chrono::Utc::now(),
             })
         }
-        // Deltas need local orderbook state to compute full prices
+        // Deltas need local orderbook state to compute full prices;
+        // handled in connect_and_run() with stateful processing.
         KalshiWsMessage::OrderbookDelta { .. } => None,
         _ => None,
+    }
+}
+
+/// Local orderbook state for computing best bid/ask from deltas.
+#[derive(Debug, Default)]
+struct LocalOrderbook {
+    /// YES side: price_str -> quantity (as f64 for delta arithmetic)
+    yes_levels: HashMap<String, f64>,
+    /// NO side: price_str -> quantity
+    no_levels: HashMap<String, f64>,
+}
+
+impl LocalOrderbook {
+    /// Initialize from a snapshot message's yes/no arrays.
+    fn from_snapshot(yes: &[Vec<serde_json::Value>], no: &[Vec<serde_json::Value>]) -> Self {
+        let mut book = Self::default();
+        for level in yes {
+            if level.len() >= 2 {
+                if let (Some(price), Some(qty)) = (
+                    level[0].as_str().map(|s| s.to_string()).or_else(|| level[0].as_f64().map(|f| format!("{:.2}", f / 100.0))),
+                    level[1].as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| level[1].as_f64()),
+                ) {
+                    book.yes_levels.insert(price, qty);
+                }
+            }
+        }
+        for level in no {
+            if level.len() >= 2 {
+                if let (Some(price), Some(qty)) = (
+                    level[0].as_str().map(|s| s.to_string()).or_else(|| level[0].as_f64().map(|f| format!("{:.2}", f / 100.0))),
+                    level[1].as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| level[1].as_f64()),
+                ) {
+                    book.no_levels.insert(price, qty);
+                }
+            }
+        }
+        book
+    }
+
+    /// Apply a delta: add/remove quantity at a price level.
+    fn apply_delta(&mut self, price_dollars: &str, delta_fp: &str, side: &str) {
+        let delta: f64 = delta_fp.parse().unwrap_or(0.0);
+        let levels = match side {
+            "yes" => &mut self.yes_levels,
+            "no" => &mut self.no_levels,
+            _ => return,
+        };
+        let entry = levels.entry(price_dollars.to_string()).or_insert(0.0);
+        *entry += delta;
+        if *entry <= 0.0 {
+            levels.remove(price_dollars);
+        }
+    }
+
+    /// Best bid = highest yes price with quantity > 0.
+    fn best_bid(&self) -> rust_decimal::Decimal {
+        self.yes_levels
+            .keys()
+            .filter_map(|p| p.parse::<rust_decimal::Decimal>().ok())
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// Best ask = lowest no price (which represents the ask side for yes).
+    fn best_ask(&self) -> rust_decimal::Decimal {
+        self.no_levels
+            .keys()
+            .filter_map(|p| p.parse::<rust_decimal::Decimal>().ok())
+            .min()
+            .unwrap_or_default()
+    }
+
+    /// Compute a PriceUpdate from the current state.
+    fn to_price_update(&self, market_ticker: &str) -> PriceUpdate {
+        PriceUpdate {
+            platform: Platform::Kalshi,
+            market_id: market_ticker.to_string(),
+            yes_price: self.best_bid(),
+            no_price: self.best_ask(),
+            timestamp: chrono::Utc::now(),
+        }
     }
 }
 
@@ -475,33 +558,31 @@ async fn connect_and_run(
 
     // Build authenticated WebSocket request with auth headers in the upgrade
     let auth_headers = auth.headers("GET", "/trade-api/ws/v2")?;
+    let key_val = auth_headers
+        .get("KALSHI-ACCESS-KEY")
+        .ok_or_else(|| KalshiError::Auth("auth headers missing key".to_string()))?
+        .to_str()
+        .map_err(|e| KalshiError::Auth(format!("invalid key header encoding: {e}")))?;
+    let sig_val = auth_headers
+        .get("KALSHI-ACCESS-SIGNATURE")
+        .ok_or_else(|| KalshiError::Auth("auth headers missing signature".to_string()))?
+        .to_str()
+        .map_err(|e| KalshiError::Auth(format!("invalid signature header encoding: {e}")))?;
+    let ts_val = auth_headers
+        .get("KALSHI-ACCESS-TIMESTAMP")
+        .ok_or_else(|| KalshiError::Auth("auth headers missing timestamp".to_string()))?
+        .to_str()
+        .map_err(|e| KalshiError::Auth(format!("invalid timestamp header encoding: {e}")))?;
+
+    let host = url.replace("wss://", "").replace("ws://", "");
+    let host = host.split('/').next().unwrap_or("");
+
     let request = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(url)
-        .header(
-            "KALSHI-ACCESS-KEY",
-            auth_headers
-                .get("KALSHI-ACCESS-KEY")
-                .expect("auth headers missing key")
-                .to_str()
-                .unwrap(),
-        )
-        .header(
-            "KALSHI-ACCESS-SIGNATURE",
-            auth_headers
-                .get("KALSHI-ACCESS-SIGNATURE")
-                .expect("auth headers missing signature")
-                .to_str()
-                .unwrap(),
-        )
-        .header(
-            "KALSHI-ACCESS-TIMESTAMP",
-            auth_headers
-                .get("KALSHI-ACCESS-TIMESTAMP")
-                .expect("auth headers missing timestamp")
-                .to_str()
-                .unwrap(),
-        )
-        .header("Host", url.replace("wss://", "").replace("ws://", "").split('/').next().unwrap_or(""))
+        .header("KALSHI-ACCESS-KEY", key_val)
+        .header("KALSHI-ACCESS-SIGNATURE", sig_val)
+        .header("KALSHI-ACCESS-TIMESTAMP", ts_val)
+        .header("Host", host)
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
@@ -530,6 +611,9 @@ async fn connect_and_run(
 
     debug!("Kalshi WS subscribed to {} tickers", tickers.len());
 
+    // Maintain local orderbook state for delta processing
+    let mut orderbooks: HashMap<String, LocalOrderbook> = HashMap::new();
+
     // Process messages with staleness detection
     let mut last_message_time = tokio::time::Instant::now();
     let ping_interval = std::time::Duration::from_secs(30);
@@ -542,8 +626,26 @@ async fn connect_and_run(
                     Some(Ok(Message::Text(text))) => {
                         last_message_time = tokio::time::Instant::now();
                         if let Some(ws_msg) = parse_ws_message(text.as_ref()) {
-                            if let Some(price_update) = ws_message_to_price_update(&ws_msg) {
-                                if tx.send(price_update).await.is_err() {
+                            let price_update = match &ws_msg {
+                                KalshiWsMessage::OrderbookSnapshot { market_ticker, yes, no } => {
+                                    let book = LocalOrderbook::from_snapshot(yes, no);
+                                    let update = book.to_price_update(market_ticker);
+                                    orderbooks.insert(market_ticker.clone(), book);
+                                    Some(update)
+                                }
+                                KalshiWsMessage::OrderbookDelta { market_ticker, price_dollars, delta_fp, side } => {
+                                    if let (Some(price), Some(delta), Some(s)) = (price_dollars.as_ref(), delta_fp.as_ref(), side.as_ref()) {
+                                        let book = orderbooks.entry(market_ticker.clone()).or_default();
+                                        book.apply_delta(price, delta, s);
+                                        Some(book.to_price_update(market_ticker))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                other => ws_message_to_price_update(other),
+                            };
+                            if let Some(update) = price_update {
+                                if tx.send(update).await.is_err() {
                                     debug!("Kalshi WS receiver dropped, exiting");
                                     return Ok(());
                                 }
@@ -807,5 +909,59 @@ mod tests {
         assert_eq!(kalshi_cents_to_decimal(1), dec!(0.01));
         assert_eq!(kalshi_cents_to_decimal(50), dec!(0.50));
         assert_eq!(kalshi_cents_to_decimal(99), dec!(0.99));
+    }
+
+    #[test]
+    fn test_local_orderbook_from_snapshot() {
+        let yes = vec![
+            vec![serde_json::Value::String("0.42".into()), serde_json::Value::String("100.00".into())],
+            vec![serde_json::Value::String("0.41".into()), serde_json::Value::String("200.00".into())],
+        ];
+        let no = vec![
+            vec![serde_json::Value::String("0.58".into()), serde_json::Value::String("100.00".into())],
+            vec![serde_json::Value::String("0.59".into()), serde_json::Value::String("200.00".into())],
+        ];
+        let book = LocalOrderbook::from_snapshot(&yes, &no);
+        assert_eq!(book.best_bid(), dec!(0.42));
+        assert_eq!(book.best_ask(), dec!(0.58));
+    }
+
+    #[test]
+    fn test_local_orderbook_apply_delta_add() {
+        let mut book = LocalOrderbook::default();
+        book.apply_delta("0.42", "100.00", "yes");
+        book.apply_delta("0.58", "100.00", "no");
+        assert_eq!(book.best_bid(), dec!(0.42));
+        assert_eq!(book.best_ask(), dec!(0.58));
+    }
+
+    #[test]
+    fn test_local_orderbook_apply_delta_remove() {
+        let mut book = LocalOrderbook::default();
+        book.apply_delta("0.42", "100.00", "yes");
+        book.apply_delta("0.43", "50.00", "yes");
+        assert_eq!(book.best_bid(), dec!(0.43));
+        // Remove the 0.43 level entirely
+        book.apply_delta("0.43", "-50.00", "yes");
+        assert_eq!(book.best_bid(), dec!(0.42));
+    }
+
+    #[test]
+    fn test_local_orderbook_empty_defaults() {
+        let book = LocalOrderbook::default();
+        assert_eq!(book.best_bid(), dec!(0));
+        assert_eq!(book.best_ask(), dec!(0));
+    }
+
+    #[test]
+    fn test_local_orderbook_price_update_from_delta() {
+        let mut book = LocalOrderbook::default();
+        book.apply_delta("0.45", "100.00", "yes");
+        book.apply_delta("0.55", "100.00", "no");
+        let update = book.to_price_update("TEST-MKT");
+        assert_eq!(update.platform, Platform::Kalshi);
+        assert_eq!(update.market_id, "TEST-MKT");
+        assert_eq!(update.yes_price, dec!(0.45));
+        assert_eq!(update.no_price, dec!(0.55));
     }
 }
