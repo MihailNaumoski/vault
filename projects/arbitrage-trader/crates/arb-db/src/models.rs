@@ -36,6 +36,7 @@ pub struct OpportunityRow {
     pub detected_at: DateTime<Utc>,
     pub executed_at: Option<DateTime<Utc>>,
     pub resolved_at: Option<DateTime<Utc>>,
+    pub mode: String,
 }
 
 /// Database row for an order.
@@ -55,6 +56,7 @@ pub struct OrderRow {
     pub filled_at: Option<DateTime<Utc>>,
     pub cancelled_at: Option<DateTime<Utc>>,
     pub cancel_reason: Option<String>,
+    pub mode: String,
 }
 
 /// Database row for a position.
@@ -74,6 +76,7 @@ pub struct PositionRow {
     pub status: String,
     pub opened_at: DateTime<Utc>,
     pub settled_at: Option<DateTime<Utc>>,
+    pub mode: String,
 }
 
 /// Database row for a price snapshot.
@@ -97,10 +100,26 @@ pub struct NewPriceSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
+/// Database row for an unwind event.
+#[derive(Debug, Clone)]
+pub struct UnwindEventRow {
+    pub id: String,
+    pub position_id: Option<String>,
+    pub platform: String,
+    pub order_id: Option<String>,
+    pub entry_price: Decimal,
+    pub exit_price: Decimal,
+    pub quantity: i64,
+    pub slippage: Decimal,
+    pub loss: Decimal,
+    pub unwound_at: DateTime<Utc>,
+}
+
 /// Database row for daily P&L.
 #[derive(Debug, Clone)]
 pub struct DailyPnlRow {
     pub date: String,
+    pub mode: String,
     pub trades_executed: i64,
     pub trades_filled: i64,
     pub gross_profit: Decimal,

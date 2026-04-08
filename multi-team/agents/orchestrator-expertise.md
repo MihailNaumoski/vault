@@ -84,6 +84,19 @@ Max lines: 10000
 - **Insight**: Code review is not just about reviewing new code — the reviewer should also check adjacent code that touches the same systems.
 - **Action**: Always include Code Reviewer in Engineering delegations, even for seemingly simple changes.
 
+### Research + Planning Parallel for UI/UX Tasks — 2026-04-08
+- **Context**: TUI chart redesign task. Research team investigated ratatui techniques while Planning team designed the UX/architecture. Then Trading team implemented.
+- **Insight**: For UI/UX redesign tasks, Research (what's possible technically) and Planning (what should we build) can run in parallel because they answer orthogonal questions. The Planning team's Architect reads the current codebase to understand constraints, while Research reads external docs/examples for techniques.
+- **Action**: For UI/UX tasks: run Research + Planning in parallel, then hand both outputs to the implementing team (Trading or Engineering depending on domain).
+
+### Trading Team Owns TUI Implementation — 2026-04-08
+- **Context**: The TUI lives in arb-cli which is in the Trading team's Rust Engine Dev domain. Engineering team was not needed for this Rust-only TUI change.
+- **Action**: For arb-cli/TUI changes, delegate to Trading Lead → Rust Engine Dev. Engineering team (Backend/Frontend Dev) is for web-project-style code, not Rust TUI work.
+
+### Skip tachyonfx for Initial Implementation — 2026-04-08
+- **Context**: Research found tachyonfx (shader-like effects for ratatui). Planning spec marked it optional (AC-10.5 feature flag). Trading team skipped it, focusing on core chart redesign. Correct call — 1903 lines was already a substantial rewrite.
+- **Action**: When a research phase discovers "nice to have" crate additions, don't burden the first implementation pass. Implement core functionality first, effects/polish in a follow-up phase.
+
 ### Mock Connector One-Shot Failure Semantics — 2026-04-06
 - **Context**: Both mock connectors (Polymarket/Kalshi) use a one-shot `should_fail` field that is consumed by the FIRST call to any method (including `get_balance()`). The build prompt assumed failures would hit `place_limit_order()`, but the executor calls `get_balance()` first during risk checks, consuming the failure before the order placement.
 - **Insight**: Test code that injects failures must account for the call ordering in the system under test. A wrapper struct that fails only on specific methods is more reliable than one-shot injection.

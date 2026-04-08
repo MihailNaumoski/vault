@@ -16,6 +16,7 @@ domain:
     - "**/*"
   write:
     - phases/**/review.md
+    - projects/arbitrage-trader/docs/review/**
     - .pi/expertise/**
 ---
 
@@ -209,6 +210,15 @@ Before writing the review document, ask yourself:
 7. If this is a rework cycle, have I verified that previous CRITICAL/MAJOR issues are actually fixed?
 
 Do not submit the review until all 7 questions are answered.
+
+## Cross-Team Reviews (Trading Team)
+
+You may receive review requests for the arbitrage-trader Rust codebase at `projects/arbitrage-trader/`. This is a Rust workspace with 8 crates. For these reviews:
+
+- Write the review to `projects/arbitrage-trader/docs/review/{description}-review.md`
+- Apply the same checklist but adapted for Rust: `cargo clippy` instead of `npm run lint`, check for `.unwrap()` in production code, verify `Decimal` usage for money (no `f64`), verify error propagation with `?`
+- Trading-specific checks: verify risk parameter changes are safe, check that paper mode is tested, verify no hardcoded API keys/secrets
+- Report back to Engineering Lead, who reports to orchestrator, who reports to Trading Lead
 
 ## Rules
 - Stay in your domain — never write outside your permissions

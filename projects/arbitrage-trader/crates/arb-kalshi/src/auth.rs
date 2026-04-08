@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::header::{HeaderMap, HeaderValue};
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::pss::BlindedSigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -19,9 +20,23 @@ pub struct KalshiAuth {
 }
 
 impl KalshiAuth {
-    /// Create from API key ID and PEM-encoded RSA private key (PKCS#8).
+    /// Create from API key ID and RSA private key (PEM or raw base64, PKCS#8 or PKCS#1).
     pub fn new(api_key_id: String, private_key_pem: &str) -> Result<Self, KalshiError> {
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
+            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(private_key_pem))
+            .or_else(|_| {
+                // Try raw base64 (no PEM headers) — decode and parse DER directly
+                use rsa::pkcs1::DecodeRsaPrivateKey as _;
+                use rsa::pkcs8::DecodePrivateKey as _;
+                let b64 = private_key_pem.trim().replace(['\n', '\r'], "");
+                let der = STANDARD.decode(&b64).map_err(|_| {
+                    rsa::pkcs1::Error::from(rsa::pkcs1::der::Error::from(
+                        rsa::pkcs1::der::ErrorKind::Failed,
+                    ))
+                })?;
+                RsaPrivateKey::from_pkcs8_der(&der)
+                    .or_else(|_| RsaPrivateKey::from_pkcs1_der(&der))
+            })
             .map_err(|e| KalshiError::Auth(format!("failed to load PEM key: {e}")))?;
         Ok(Self {
             api_key_id,

@@ -13,7 +13,7 @@ arb-db = { workspace = true }
 arb-risk = { workspace = true }
 arb-engine = { workspace = true }
 arb-polymarket = { workspace = true }
-arb-kalshi = { workspace = true, features = ["mock"] }
+arb-kalshi = { workspace = true }
 arb-matcher = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

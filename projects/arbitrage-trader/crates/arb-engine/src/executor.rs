@@ -8,6 +8,7 @@ use arb_types::{
 };
 use chrono::Utc;
 use parking_lot::RwLock;
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -18,6 +19,7 @@ pub struct Executor {
     risk_manager: Arc<RwLock<RiskManager>>,
     db: Arc<SqliteRepository>,
     config: OrderConfig,
+    mode: String,
 }
 
 impl Executor {
@@ -27,6 +29,7 @@ impl Executor {
         risk_manager: Arc<RwLock<RiskManager>>,
         db: Arc<SqliteRepository>,
         config: OrderConfig,
+        mode: String,
     ) -> Self {
         Self {
             poly,
@@ -34,6 +37,7 @@ impl Executor {
             risk_manager,
             db,
             config,
+            mode,
         }
     }
 
@@ -68,20 +72,28 @@ impl Executor {
             .map_err(|e| ArbError::Other(format!("risk check failed: {e}")))?;
         }
 
-        // 2. Build orders
+        // 2. Build orders — improve prices by configured amount to increase fill probability
         opp.max_quantity = quantity;
         opp.status = OpportunityStatus::Executing;
 
+        // Cap price improvement: skip if spread can't absorb it (< 2x improve),
+        // otherwise cap at 25% of spread to preserve profit margin.
+        let max_improve = self.config.price_improve_amount;
+        let improve = if opp.spread < max_improve * Decimal::from(2) {
+            Decimal::ZERO
+        } else {
+            max_improve.min(opp.spread * Decimal::new(25, 2))
+        };
         let poly_req = LimitOrderRequest {
             market_id: opp.poly_yes_token_id.clone(),
             side: opp.poly_side,
-            price: opp.poly_price,
+            price: opp.poly_price + improve,
             quantity,
         };
         let kalshi_req = LimitOrderRequest {
             market_id: opp.kalshi_market_id.clone(),
             side: opp.kalshi_side,
-            price: opp.kalshi_price,
+            price: opp.kalshi_price + improve,
             quantity,
         };
 
@@ -159,6 +171,7 @@ impl Executor {
             detected_at: opp.detected_at,
             executed_at: Some(Utc::now()),
             resolved_at: None,
+            mode: self.mode.clone(),
         };
         if let Err(e) = self.db.insert_opportunity(&row).await {
             error!(opp_id = %opp.id, err = %e, "failed to persist opportunity");
@@ -187,6 +200,7 @@ impl Executor {
             filled_at: None,
             cancelled_at: None,
             cancel_reason: None,
+            mode: self.mode.clone(),
         };
         if let Err(e) = self.db.insert_order(&row).await {
             error!(opp_id = %opp_id, err = %e, "failed to persist order");

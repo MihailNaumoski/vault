@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
 use rust_decimal_macros::dec;
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use arb_engine::engine::Engine;
 use arb_engine::executor::Executor;
+use arb_engine::fees::FeeConfig;
 use arb_engine::monitor::Monitor;
 use arb_engine::paper::PaperConnector;
 use arb_engine::price_cache::PriceCache;
@@ -25,9 +26,24 @@ mod tui;
 #[derive(Parser, Debug)]
 #[command(name = "arb", about = "Cross-platform prediction market arbitrage")]
 struct Args {
-    /// Run in paper trading mode (connect to real APIs, simulate orders).
+    /// Hybrid paper mode: real Kalshi (demo or prod) + simulated Polymarket orders.
+    /// This is the recommended testing mode.
     #[arg(long)]
     paper: bool,
+
+    /// Full paper mode: wrap BOTH connectors in PaperConnector (all orders simulated).
+    #[arg(long)]
+    paper_both: bool,
+
+    /// Use Kalshi demo sandbox (demo-api.kalshi.co) instead of production.
+    /// This is the DEFAULT — production requires --production flag.
+    #[arg(long)]
+    demo: bool,
+
+    /// Use Kalshi PRODUCTION API. Requires explicit opt-in.
+    /// WARNING: Real money at risk!
+    #[arg(long)]
+    production: bool,
 
     /// Run market matcher only — show proposed pairs and exit.
     #[arg(long, rename_all = "kebab-case")]
@@ -49,10 +65,18 @@ struct AppConfig {
     engine: EngineConfig,
     orders: OrdersConfig,
     risk: arb_risk::RiskConfig,
+    fees: FeesConfig,
     polymarket: PlatformConfig,
-    kalshi: KalshiConfig,
+    kalshi: KalshiTomlConfig,
     database: DatabaseConfig,
     logging: LoggingConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct FeesConfig {
+    kalshi_taker_fee_pct: String,
+    poly_taker_fee_pct: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,9 +109,11 @@ struct PlatformConfig {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct KalshiConfig {
-    api_url: String,
+struct KalshiTomlConfig {
+    base_url: String,
     ws_url: String,
+    demo_base_url: String,
+    demo_ws_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,7 +175,7 @@ async fn main() -> Result<()> {
     let app_config: AppConfig = settings.try_deserialize()?;
 
     // Initialize tracing (logs to file when TUI is active)
-    let tui_active = args.tui || (!args.headless && !args.paper);
+    let tui_active = args.tui || (!args.headless && !args.paper && !args.paper_both);
     let _ = std::fs::create_dir_all("data");
     init_tracing(&app_config.logging, tui_active);
 
@@ -313,15 +339,47 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // === Validate flags ===
+    if args.production && args.demo {
+        anyhow::bail!("Cannot use --production and --demo at the same time");
+    }
+    if args.paper && args.paper_both {
+        anyhow::bail!("Cannot use --paper and --paper-both at the same time. Use --paper for hybrid mode or --paper-both for full simulation.");
+    }
+
+    // Default to demo unless --production is explicitly set
+    let use_demo = !args.production;
+
+    // === Derive trading mode for DB tagging ===
+    let trading_mode: String = if args.paper_both || args.paper {
+        "paper".into()
+    } else if use_demo {
+        "demo".into()
+    } else {
+        "production".into()
+    };
+
     // === Startup banner ===
-    let mode = if args.paper { "PAPER" } else { "LIVE" };
+    let mode = if args.paper_both {
+        "PAPER-BOTH"
+    } else if args.paper {
+        "PAPER-HYBRID"
+    } else {
+        "LIVE"
+    };
+    let kalshi_env = if use_demo { "DEMO" } else { "PRODUCTION" };
     info!("===========================================");
     info!("  Prediction Market Arbitrage System");
     info!("  Mode: {}", mode);
-    if args.paper {
-        info!("  PAPER TRADING — no real orders will be placed");
+    info!("  Kalshi: {}", kalshi_env);
+    if args.paper_both {
+        info!("  FULL PAPER — all orders simulated on both platforms");
+    } else if args.paper {
+        info!("  HYBRID PAPER — real Kalshi ({}) + simulated Polymarket", kalshi_env);
+    } else if use_demo {
+        info!("  LIVE on Kalshi DEMO sandbox + real Polymarket");
     } else {
-        warn!("  LIVE TRADING — real money at risk!");
+        warn!("  *** LIVE TRADING — REAL MONEY AT RISK ***");
     }
     info!("===========================================");
 
@@ -331,16 +389,23 @@ async fn main() -> Result<()> {
     db.run_migrations().await?;
     info!("Database initialized");
 
+    // === Load manually configured pairs from config/pairs.toml ===
+    let pair_store = arb_matcher::PairStore::new(db.clone());
+    match pair_store.load_from_toml("config/pairs.toml").await {
+        Ok(n) => info!(inserted = n, "Loaded pairs from config/pairs.toml"),
+        Err(e) => warn!(err = %e, "Could not load pairs.toml (file may not exist)"),
+    }
+
     // === Init risk manager ===
     let rm = Arc::new(parking_lot::RwLock::new(arb_risk::RiskManager::new(app_config.risk)));
     rm.write().set_engine_running(true);
 
     // === Init Polymarket connector ===
     let poly_config = arb_polymarket::PolyConfig {
-        api_key: std::env::var("POLY_API_KEY").expect("POLY_API_KEY not set"),
-        secret: std::env::var("POLY_API_SECRET").expect("POLY_API_SECRET not set"),
-        passphrase: std::env::var("POLY_PASSPHRASE").expect("POLY_PASSPHRASE not set"),
-        private_key: std::env::var("POLY_PRIVATE_KEY").expect("POLY_PRIVATE_KEY not set"),
+        api_key: std::env::var("POLY_API_KEY").context("POLY_API_KEY env var not set")?,
+        secret: std::env::var("POLY_API_SECRET").context("POLY_API_SECRET env var not set")?,
+        passphrase: std::env::var("POLY_PASSPHRASE").context("POLY_PASSPHRASE env var not set")?,
+        private_key: std::env::var("POLY_PRIVATE_KEY").context("POLY_PRIVATE_KEY env var not set")?,
         clob_url: app_config.polymarket.clob_url.clone(),
         gamma_url: app_config.polymarket.gamma_url.clone(),
         ws_url: app_config.polymarket.ws_url.clone(),
@@ -348,34 +413,60 @@ async fn main() -> Result<()> {
     };
     let poly_real = Arc::new(
         arb_polymarket::PolymarketConnector::new(poly_config)
-            .expect("failed to create Polymarket connector"),
+            .context("failed to create Polymarket connector")?,
     );
     info!("Polymarket connector initialized");
+
+    // === Init Kalshi connector (real) ===
+    let (kalshi_base_url, kalshi_ws_url) = if use_demo {
+        info!("Using Kalshi DEMO sandbox");
+        (
+            app_config.kalshi.demo_base_url.clone(),
+            app_config.kalshi.demo_ws_url.clone(),
+        )
+    } else {
+        warn!("Using Kalshi PRODUCTION API — real money at risk!");
+        (
+            app_config.kalshi.base_url.clone(),
+            app_config.kalshi.ws_url.clone(),
+        )
+    };
+
+    // Read Kalshi credentials from env vars
+    let kalshi_api_key_id = std::env::var("KALSHI_API_KEY_ID")
+        .context("KALSHI_API_KEY_ID env var not set — required for Kalshi connector")?;
+    let kalshi_private_key_pem = if let Ok(path) = std::env::var("KALSHI_PRIVATE_KEY_PATH") {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read Kalshi private key from {path}"))?
+    } else {
+        let raw = std::env::var("KALSHI_PRIVATE_KEY_PEM")
+            .context("Set KALSHI_PRIVATE_KEY_PATH (path to .pem file) or KALSHI_PRIVATE_KEY_PEM (raw base64/PEM string)")?;
+        // Handle literal \n in .env files
+        raw.replace("\\n", "\n")
+    };
+
+    let kalshi_config = arb_kalshi::KalshiConfig {
+        api_key_id: kalshi_api_key_id,
+        private_key_pem: kalshi_private_key_pem,
+        base_url: kalshi_base_url.clone(),
+        ws_url: kalshi_ws_url.clone(),
+    };
+    let kalshi_real = Arc::new(
+        arb_kalshi::KalshiConnector::new(kalshi_config)
+            .context("Failed to create Kalshi connector")?
+    );
+    info!(base_url = %kalshi_base_url, "Kalshi connector initialized");
 
     // === Seed market pairs ===
     use arb_db::Repository;
     use arb_db::models::MarketPairRow;
-    use arb_types::order::OrderBookLevel;
 
-    // Kalshi mock state
-    let kalshi_state = Arc::new(parking_lot::Mutex::new(arb_kalshi::mock::MockState::default()));
-    kalshi_state.lock().balance = rust_decimal_macros::dec!(10000);
-
-    let db_pairs = db.list_active_market_pairs().await.unwrap_or_default();
+    let db_pairs: Vec<_> = db.list_active_market_pairs().await.unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.kalshi_ticker.starts_with("KMOCK-"))
+        .collect();
     let pairs: Vec<PairInfo> = if !db_pairs.is_empty() {
         info!(pairs = db_pairs.len(), "Loaded existing pairs from DB");
-        for p in &db_pairs {
-            let mut ks = kalshi_state.lock();
-            ks.order_books.insert(
-                p.kalshi_ticker.clone(),
-                arb_types::OrderBook {
-                    market_id: p.kalshi_ticker.clone(),
-                    bids: vec![OrderBookLevel { price: rust_decimal_macros::dec!(0.40), quantity: 200 }],
-                    asks: vec![OrderBookLevel { price: rust_decimal_macros::dec!(0.45), quantity: 200 }],
-                    timestamp: Utc::now(),
-                },
-            );
-        }
         let mut pairs_vec: Vec<PairInfo> = db_pairs.iter().map(|p| PairInfo {
             pair_id: uuid::Uuid::parse_str(&p.id).unwrap_or_else(|_| uuid::Uuid::now_v7()),
             poly_market_id: p.poly_condition_id.clone(),
@@ -420,29 +511,40 @@ async fn main() -> Result<()> {
         }
         pairs_vec
     } else {
-        info!("No pairs in DB — fetching live Polymarket markets...");
+        info!("No pairs in DB — fetching live markets from both platforms...");
 
-        // Fetch real markets directly via HTTP (bypasses connector parsing issues)
+        // Fetch real Polymarket markets via Gamma API
         let gamma_url = &app_config.polymarket.gamma_url;
         let http = reqwest::Client::new();
         let resp = http.get(format!("{gamma_url}/markets?active=true&closed=false&limit=100&order=volume24hr&ascending=false"))
             .send().await;
 
+        // Fetch real Kalshi markets
+        let kalshi_markets = match kalshi_real.list_markets(MarketStatus::Open).await {
+            Ok(markets) => {
+                info!(count = markets.len(), "Fetched open Kalshi markets");
+                markets
+            }
+            Err(e) => {
+                warn!(err = %e, "Failed to fetch Kalshi markets — will use DB pairs only");
+                Vec::new()
+            }
+        };
+
         let mut seeded = Vec::new();
         if let Ok(resp) = resp {
             if let Ok(raw_markets) = resp.json::<Vec<serde_json::Value>>().await {
-                let offsets = [
-                    rust_decimal_macros::dec!(0.03), rust_decimal_macros::dec!(0.04),
-                    rust_decimal_macros::dec!(0.05), rust_decimal_macros::dec!(0.03),
-                    rust_decimal_macros::dec!(0.04),
-                ];
-
                 info!(total = raw_markets.len(), "Gamma API returned markets");
 
-                let mut count = 0usize;
-                for m in &raw_markets {
-                    if count >= 12 { break; }
+                // Build a match pipeline to pair real Poly markets with real Kalshi markets
+                let pipeline = MatchPipeline::default();
 
+                // Convert raw Gamma markets to Market type for matching
+                let mut poly_markets_for_match: Vec<Market> = Vec::new();
+                // Keep track of raw data for token IDs
+                let mut poly_raw_by_cid: std::collections::HashMap<String, &serde_json::Value> = std::collections::HashMap::new();
+
+                for m in &raw_markets {
                     let condition_id = m["conditionId"].as_str().unwrap_or_default();
                     let question = m["question"].as_str().unwrap_or_default();
                     let outcome_prices_str = m["outcomePrices"].as_str().unwrap_or("[]");
@@ -451,142 +553,138 @@ async fn main() -> Result<()> {
                         .as_f64().or_else(|| m["volume"].as_f64()).unwrap_or(0.0)
                         .try_into().unwrap_or_default();
 
-                    // Parse prices
                     let prices: Vec<String> = serde_json::from_str(outcome_prices_str).unwrap_or_default();
-                    if prices.len() < 2 {
-                        info!(question, "Skipped: no outcomePrices");
-                        continue;
-                    }
+                    if prices.len() < 2 { continue; }
                     let poly_yes: rust_decimal::Decimal = prices[0].parse().unwrap_or_default();
-                    let _poly_no: rust_decimal::Decimal = prices[1].parse().unwrap_or_default();
+                    let poly_no: rust_decimal::Decimal = prices[1].parse().unwrap_or_default();
 
-                    // Skip very extreme prices (< 5% or > 95%) — allow wider range
-                    if poly_yes < rust_decimal_macros::dec!(0.05) || poly_yes > rust_decimal_macros::dec!(0.95) {
-                        info!(question, yes = %poly_yes, "Skipped: price too extreme");
-                        continue;
-                    }
+                    if poly_yes < dec!(0.05) || poly_yes > dec!(0.95) { continue; }
                     if condition_id.is_empty() { continue; }
 
-                    // Extract token IDs directly from the bulk response (avoids per-market API call)
-                    let (yes_token_id, no_token_id) = {
-                        // Try clobTokenIds field (JSON-encoded string array)
-                        let clob_str = m["clobTokenIds"].as_str().unwrap_or("[]");
-                        let clob_ids: Vec<String> = serde_json::from_str(clob_str).unwrap_or_default();
-                        if clob_ids.len() >= 2 {
-                            (clob_ids[0].clone(), clob_ids[1].clone())
-                        } else {
-                            // Try tokens array fallback
-                            let tokens = m["tokens"].as_array();
-                            let mut yes_id = String::new();
-                            let mut no_id = String::new();
-                            if let Some(tokens) = tokens {
-                                for t in tokens {
-                                    let outcome = t["outcome"].as_str().unwrap_or_default();
-                                    let tid = t["token_id"].as_str().unwrap_or_default();
-                                    match outcome.to_lowercase().as_str() {
-                                        "yes" => yes_id = tid.to_string(),
-                                        "no" => no_id = tid.to_string(),
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            if yes_id.is_empty() || no_id.is_empty() {
-                                warn!(condition_id, "No token IDs found in bulk response, skipping");
-                                continue;
-                            }
-                            (yes_id, no_id)
-                        }
-                    };
-
-                    let pair_id = uuid::Uuid::now_v7();
-                    let kalshi_ticker = format!("KMOCK-{}", count + 1);
-                    let offset = offsets[count % offsets.len()];
-                    let kalshi_yes = (poly_yes - offset).max(rust_decimal_macros::dec!(0.05));
-                    let kalshi_no = rust_decimal_macros::dec!(1) - kalshi_yes;
                     let close_time = chrono::NaiveDate::parse_from_str(end_date, "%Y-%m-%d")
                         .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
                         .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
                         .unwrap_or_else(|_| Utc::now() + chrono::Duration::days(30));
 
-                    // Seed Kalshi mock
-                    {
-                        let mut ks = kalshi_state.lock();
-                        ks.markets.push(Market {
-                            id: MarketId::new(), platform: Platform::Kalshi,
-                            platform_id: kalshi_ticker.clone(),
-                            question: format!("[Mock] {question}"),
-                            yes_price: kalshi_yes, no_price: kalshi_no,
-                            volume: rust_decimal_macros::dec!(100000),
-                            liquidity: rust_decimal_macros::dec!(50000),
-                            status: MarketStatus::Open,
-                            close_time, updated_at: Utc::now(),
-                        });
-                        ks.order_books.insert(kalshi_ticker.clone(), arb_types::OrderBook {
-                            market_id: kalshi_ticker.clone(),
-                            bids: vec![OrderBookLevel { price: kalshi_yes - rust_decimal_macros::dec!(0.02), quantity: 200 }],
-                            asks: vec![OrderBookLevel { price: kalshi_yes, quantity: 200 }],
-                            timestamp: Utc::now(),
-                        });
-                    }
-
-                    let row = MarketPairRow {
-                        id: pair_id.to_string(),
-                        poly_condition_id: condition_id.to_string(),
-                        poly_yes_token_id: yes_token_id.clone(), poly_no_token_id: no_token_id.clone(),
-                        poly_question: question.to_string(),
-                        kalshi_ticker: kalshi_ticker.clone(),
-                        kalshi_question: format!("[Mock] {question}"),
-                        match_confidence: 0.95, verified: true, active: true,
-                        close_time, created_at: Utc::now(), updated_at: Utc::now(),
-                    };
-                    if let Err(e) = db.insert_market_pair(&row).await {
-                        warn!(err = %e, "Failed to insert pair");
-                        continue;
-                    }
-
-                    info!(
-                        question,
-                        poly_yes = %poly_yes,
-                        kalshi_yes = %kalshi_yes,
-                        spread = %offset,
-                        "Seeded pair with real Polymarket market"
-                    );
-
-                    seeded.push(PairInfo {
-                        pair_id, poly_market_id: condition_id.to_string(),
-                        kalshi_market_id: kalshi_ticker, close_time, verified: true,
-                        poly_yes_token_id: yes_token_id, poly_no_token_id: no_token_id,
+                    poly_raw_by_cid.insert(condition_id.to_string(), m);
+                    poly_markets_for_match.push(Market {
+                        id: MarketId::new(),
+                        platform: Platform::Polymarket,
+                        platform_id: condition_id.to_string(),
+                        question: question.to_string(),
+                        yes_price: poly_yes,
+                        no_price: poly_no,
                         volume: market_volume,
+                        liquidity: rust_decimal::Decimal::ZERO,
+                        status: MarketStatus::Open,
+                        close_time,
+                        updated_at: Utc::now(),
                     });
-                    count += 1;
+                }
+
+                // Run the match pipeline if we have Kalshi markets
+                if !kalshi_markets.is_empty() && !poly_markets_for_match.is_empty() {
+                    let candidates = pipeline.find_matches(&poly_markets_for_match, &kalshi_markets);
+                    info!(candidates = candidates.len(), "Match pipeline produced candidates");
+
+                    let mut count = 0usize;
+                    for c in &candidates {
+                        if count >= 12 { break; }
+                        let decision = c.score.decision();
+                        if decision == arb_matcher::MatchDecision::Rejected { continue; }
+
+                        let condition_id = &c.poly_market.platform_id;
+                        let kalshi_ticker = &c.kalshi_market.platform_id;
+
+                        // Extract token IDs from the raw Gamma data
+                        let (yes_token_id, no_token_id) = if let Some(m) = poly_raw_by_cid.get(condition_id) {
+                            extract_token_ids(m)
+                        } else {
+                            (String::new(), String::new())
+                        };
+
+                        if yes_token_id.is_empty() || no_token_id.is_empty() {
+                            warn!(condition_id, "No token IDs found, skipping");
+                            continue;
+                        }
+
+                        let pair_id = uuid::Uuid::now_v7();
+                        let row = MarketPairRow {
+                            id: pair_id.to_string(),
+                            poly_condition_id: condition_id.to_string(),
+                            poly_yes_token_id: yes_token_id.clone(),
+                            poly_no_token_id: no_token_id.clone(),
+                            poly_question: c.poly_market.question.clone(),
+                            kalshi_ticker: kalshi_ticker.to_string(),
+                            kalshi_question: c.kalshi_market.question.clone(),
+                            match_confidence: c.score.composite,
+                            verified: decision == arb_matcher::MatchDecision::AutoVerified,
+                            active: true,
+                            close_time: c.poly_market.close_time,
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                        };
+                        if let Err(e) = db.insert_market_pair(&row).await {
+                            warn!(err = %e, "Failed to insert pair");
+                            continue;
+                        }
+
+                        info!(
+                            poly_question = %c.poly_market.question,
+                            kalshi_question = %c.kalshi_market.question,
+                            score = c.score.composite,
+                            "Paired real markets"
+                        );
+
+                        seeded.push(PairInfo {
+                            pair_id,
+                            poly_market_id: condition_id.to_string(),
+                            kalshi_market_id: kalshi_ticker.to_string(),
+                            close_time: c.poly_market.close_time,
+                            verified: decision == arb_matcher::MatchDecision::AutoVerified,
+                            poly_yes_token_id: yes_token_id,
+                            poly_no_token_id: no_token_id,
+                            volume: c.poly_market.volume,
+                        });
+                        count += 1;
+                    }
+                } else {
+                    warn!("No Kalshi markets available for matching — cannot seed pairs automatically");
                 }
             }
         }
         if seeded.is_empty() {
-            warn!("Could not fetch Polymarket markets — check internet connection");
+            warn!("No pairs seeded — check internet connection and API credentials");
         } else {
-            info!(pairs = seeded.len(), "Seeded pairs from live Polymarket data");
+            info!(pairs = seeded.len(), "Seeded pairs from live market data");
         }
         seeded
     };
 
-    // === Create Kalshi mock connector and wrap both in PaperConnector ===
-    let kalshi_state_for_feed = kalshi_state.clone();
-    let kalshi_mock: Arc<dyn PredictionMarketConnector> = Arc::new(
-        arb_kalshi::MockKalshiConnector::with_state(kalshi_state),
-    );
-
+    // === Wrap connectors based on trading mode ===
+    let kalshi_dyn: Arc<dyn PredictionMarketConnector> = kalshi_real.clone();
     let poly_dyn: Arc<dyn PredictionMarketConnector> = poly_real.clone();
+
     let (poly, kalshi): (Arc<dyn PredictionMarketConnector>, Arc<dyn PredictionMarketConnector>) =
-        if args.paper {
-            info!("Wrapping connectors in PaperConnector (simulated trading)");
+        if args.paper_both {
+            info!("Full paper mode — wrapping BOTH connectors in PaperConnector");
             (
-                Arc::new(PaperConnector::new(poly_dyn, rust_decimal_macros::dec!(10000), 0.9, 500)),
-                Arc::new(PaperConnector::new(kalshi_mock, rust_decimal_macros::dec!(10000), 0.9, 500)),
+                Arc::new(PaperConnector::new(poly_dyn, dec!(10000), 0.9, 500)),
+                Arc::new(PaperConnector::new(kalshi_dyn, dec!(10000), 0.9, 500)),
+            )
+        } else if args.paper {
+            info!("Hybrid paper mode — real Kalshi + simulated Polymarket");
+            (
+                Arc::new(PaperConnector::new(poly_dyn, dec!(10000), 0.9, 500)),
+                kalshi_dyn,
             )
         } else {
-            warn!("LIVE MODE — using real connectors");
-            (poly_dyn, kalshi_mock)
+            if use_demo {
+                info!("Live mode with Kalshi DEMO sandbox");
+            } else {
+                warn!("LIVE MODE — using real connectors on both platforms");
+            }
+            (poly_dyn, kalshi_dyn)
         };
     info!("Connectors initialized");
 
@@ -611,19 +709,33 @@ async fn main() -> Result<()> {
         price_cache.register_pair(p.pair_id, poly_cache_id, &p.kalshi_market_id);
     }
 
-    let executor = Executor::new(poly.clone(), kalshi.clone(), rm.clone(), db.clone(), order_cfg.clone());
+    let fee_config = FeeConfig {
+        kalshi_taker_fee_pct: app_config.fees.kalshi_taker_fee_pct.parse().unwrap_or(rust_decimal_macros::dec!(7.0)),
+        poly_taker_fee_pct: app_config.fees.poly_taker_fee_pct.parse().unwrap_or(rust_decimal_macros::dec!(0.0)),
+    };
+    info!(
+        kalshi_fee = %fee_config.kalshi_taker_fee_pct,
+        poly_fee = %fee_config.poly_taker_fee_pct,
+        "Fee configuration loaded"
+    );
+
+    let executor = Executor::new(poly.clone(), kalshi.clone(), rm.clone(), db.clone(), order_cfg.clone(), trading_mode.clone());
     let monitor = Monitor::new(poly.clone(), kalshi.clone(), order_cfg);
-    let tracker = Tracker::new(db.clone(), rm.clone());
-    let unwinder = Unwinder::new(poly.clone(), kalshi.clone(), rm.clone());
+    let tracker = Tracker::new(db.clone(), rm.clone(), trading_mode.clone(), fee_config.clone());
+    let unwinder = Unwinder::new(poly.clone(), kalshi.clone(), rm.clone(), db.clone());
 
     let engine = Arc::new(Engine::new(
-        poly.clone(), kalshi.clone(), price_cache.clone(),
-        executor, monitor, tracker, unwinder, engine_cfg,
+        poly.clone(), kalshi.clone(), price_cache.clone(), db.clone(),
+        executor, monitor, tracker, unwinder, engine_cfg, trading_mode.clone(), fee_config,
     ));
     info!("Engine initialized");
 
     // === Price feeds ===
     let (price_tx, price_rx) = tokio::sync::mpsc::channel(256);
+
+    // Collect WS subscription handles so they are dropped cleanly on shutdown
+    // instead of being leaked via std::mem::forget.
+    let mut _ws_handles: Vec<arb_types::SubHandle> = Vec::new();
 
     // Polymarket WS subscription
     let poly_token_ids: Vec<String> = pairs.iter()
@@ -635,7 +747,7 @@ async fn main() -> Result<()> {
         match poly.subscribe_prices(&poly_token_ids, price_tx.clone()).await {
             Ok(handle) => {
                 info!(count = poly_token_ids.len(), "Polymarket WS price feed started");
-                std::mem::forget(handle);
+                _ws_handles.push(handle);
             }
             Err(e) => {
                 warn!(err = %e, "Failed to start Polymarket WS feed");
@@ -692,33 +804,46 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Kalshi mock price feed
-    {
-        let kalshi_feed_pairs: Vec<(String, rust_decimal::Decimal)> = {
-            let ks = kalshi_state_for_feed.lock();
-            pairs.iter().filter_map(|p| {
-                let km = ks.markets.iter().find(|m| m.platform_id == p.kalshi_market_id)?;
-                Some((p.kalshi_market_id.clone(), km.yes_price))
-            }).collect()
-        };
-        if !kalshi_feed_pairs.is_empty() {
-            let ptx = price_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    for (kalshi_id, kalshi_base) in &kalshi_feed_pairs {
-                        // Static price — no jitter. Kalshi mock stays at the seeded price.
-                        let _ = ptx.send(arb_types::PriceUpdate {
-                            platform: Platform::Kalshi,
-                            market_id: kalshi_id.clone(),
-                            yes_price: *kalshi_base,
-                            no_price: rust_decimal_macros::dec!(1) - *kalshi_base,
-                            timestamp: Utc::now(),
-                        }).await;
+    // Kalshi WS price feed (real)
+    let kalshi_ticker_ids: Vec<String> = pairs.iter()
+        .map(|p| p.kalshi_market_id.clone())
+        .collect();
+
+    if !kalshi_ticker_ids.is_empty() {
+        match kalshi.subscribe_prices(&kalshi_ticker_ids, price_tx.clone()).await {
+            Ok(handle) => {
+                info!(count = kalshi_ticker_ids.len(), "Kalshi WS price feed started");
+                _ws_handles.push(handle);
+            }
+            Err(e) => {
+                warn!(err = %e, "Failed to start Kalshi WS feed — falling back to REST polling");
+                // REST polling fallback for Kalshi
+                let kalshi_poll = kalshi.clone();
+                let kalshi_poll_tickers: Vec<String> = kalshi_ticker_ids.clone();
+                let ptx = price_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        for ticker in &kalshi_poll_tickers {
+                            match kalshi_poll.get_market(ticker).await {
+                                Ok(market) => {
+                                    let _ = ptx.send(arb_types::PriceUpdate {
+                                        platform: Platform::Kalshi,
+                                        market_id: ticker.clone(),
+                                        yes_price: market.yes_price,
+                                        no_price: market.no_price,
+                                        timestamp: Utc::now(),
+                                    }).await;
+                                }
+                                Err(e) => {
+                                    warn!(ticker, err = %e, "Kalshi REST poll failed");
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(8)).await;
                     }
-                    tokio::time::sleep(Duration::from_secs(8)).await;
-                }
-            });
-            info!("Kalshi mock price feed started");
+                });
+                info!("Kalshi REST polling fallback started (8s interval)");
+            }
         }
     }
 
@@ -758,7 +883,7 @@ async fn main() -> Result<()> {
     });
 
     // === TUI or headless ===
-    if args.tui || (!args.headless && !args.paper) {
+    if args.tui || (!args.headless && !args.paper && !args.paper_both) {
         // Set panic hook to restore terminal on panic
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
@@ -779,6 +904,32 @@ async fn main() -> Result<()> {
 
     info!("Shutdown complete");
     Ok(())
+}
+
+/// Extract Polymarket token IDs from a raw Gamma API market JSON object.
+fn extract_token_ids(m: &serde_json::Value) -> (String, String) {
+    // Try clobTokenIds field (JSON-encoded string array)
+    let clob_str = m["clobTokenIds"].as_str().unwrap_or("[]");
+    let clob_ids: Vec<String> = serde_json::from_str(clob_str).unwrap_or_default();
+    if clob_ids.len() >= 2 {
+        return (clob_ids[0].clone(), clob_ids[1].clone());
+    }
+    // Try tokens array fallback
+    let tokens = m["tokens"].as_array();
+    let mut yes_id = String::new();
+    let mut no_id = String::new();
+    if let Some(tokens) = tokens {
+        for t in tokens {
+            let outcome = t["outcome"].as_str().unwrap_or_default();
+            let tid = t["token_id"].as_str().unwrap_or_default();
+            match outcome.to_lowercase().as_str() {
+                "yes" => yes_id = tid.to_string(),
+                "no" => no_id = tid.to_string(),
+                _ => {}
+            }
+        }
+    }
+    (yes_id, no_id)
 }
 
 async fn write_health_file(

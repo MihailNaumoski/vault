@@ -1,6 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -341,19 +341,26 @@ pub(crate) fn ws_message_to_price_update(msg: &KalshiWsMessage) -> Option<PriceU
             yes_ask_dollars,
             ..
         } => {
-            // Prefer dollar fields, fall back to cents
+            // Prefer dollar fields, fall back to cents.
+            // CRITICAL: Never default to zero — a zero price creates phantom spreads
+            // in the detector (spread = 1 - poly - 0 ≈ 0.98). If we can't determine
+            // a price, skip the update entirely so stale-but-real data is preserved.
             let yes_p = yes_bid_dollars
                 .as_ref()
                 .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
-                .or_else(|| yes_price.map(kalshi_cents_to_decimal))
-                .unwrap_or_default();
+                .or_else(|| yes_price.map(kalshi_cents_to_decimal));
 
             let no_p = yes_ask_dollars
                 .as_ref()
                 .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
                 .map(|ask| rust_decimal_macros::dec!(1) - ask)
-                .or_else(|| no_price.map(kalshi_cents_to_decimal))
-                .unwrap_or_default();
+                .or_else(|| no_price.map(kalshi_cents_to_decimal));
+
+            // Both prices must be present; partial updates would corrupt spread math
+            let (yes_p, no_p) = match (yes_p, no_p) {
+                (Some(y), Some(n)) => (y, n),
+                _ => return None,
+            };
 
             Some(PriceUpdate {
                 platform: Platform::Kalshi,
@@ -368,36 +375,13 @@ pub(crate) fn ws_message_to_price_update(msg: &KalshiWsMessage) -> Option<PriceU
             yes,
             no,
         } => {
-            // Extract best prices from snapshot
-            let yes_price = yes
-                .first()
-                .and_then(|level| level.first())
-                .and_then(|v| match v {
-                    serde_json::Value::String(s) => s.parse::<rust_decimal::Decimal>().ok(),
-                    serde_json::Value::Number(n) => {
-                        n.as_u64().map(|c| kalshi_cents_to_decimal(c as u32))
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let no_price = no
-                .first()
-                .and_then(|level| level.first())
-                .and_then(|v| match v {
-                    serde_json::Value::String(s) => s.parse::<rust_decimal::Decimal>().ok(),
-                    serde_json::Value::Number(n) => {
-                        n.as_u64().map(|c| kalshi_cents_to_decimal(c as u32))
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
-            Some(PriceUpdate {
-                platform: Platform::Kalshi,
-                market_id: market_ticker.clone(),
-                yes_price,
-                no_price,
-                timestamp: chrono::Utc::now(),
-            })
+            // Delegate to LocalOrderbook for consistent price derivation.
+            // This ensures the snapshot path uses the same logic as the delta
+            // path (best_bid for YES, best_no_bid for NO), avoiding the
+            // inconsistency where this path previously used the first NO level
+            // while the delta path used a different derivation.
+            let book = LocalOrderbook::from_snapshot(yes, no);
+            book.to_price_update(market_ticker)
         }
         // Deltas need local orderbook state to compute full prices;
         // handled in connect_and_run() with stateful processing.
@@ -458,32 +442,49 @@ impl LocalOrderbook {
     }
 
     /// Best bid = highest yes price with quantity > 0.
-    fn best_bid(&self) -> rust_decimal::Decimal {
+    /// Returns `None` when the yes side is empty (no levels).
+    fn best_bid(&self) -> Option<rust_decimal::Decimal> {
         self.yes_levels
             .keys()
             .filter_map(|p| p.parse::<rust_decimal::Decimal>().ok())
             .max()
-            .unwrap_or_default()
     }
 
-    /// Best ask = lowest no price (which represents the ask side for yes).
-    fn best_ask(&self) -> rust_decimal::Decimal {
+    /// Best NO bid = highest NO bid price (max of no_levels).
+    /// In Kalshi's binary market, the best NO bid at price P means there's a
+    /// YES ask at (1-P). So: yes_best_ask = 1 - best_no_bid.
+    /// Returns `None` when the NO side is empty (no levels).
+    fn best_no_bid(&self) -> Option<rust_decimal::Decimal> {
         self.no_levels
             .keys()
             .filter_map(|p| p.parse::<rust_decimal::Decimal>().ok())
-            .min()
-            .unwrap_or_default()
+            .max()
     }
 
     /// Compute a PriceUpdate from the current state.
-    fn to_price_update(&self, market_ticker: &str) -> PriceUpdate {
-        PriceUpdate {
+    ///
+    /// Derives prices consistently with the ticker handler:
+    /// - `yes_price` = best YES bid (highest bid on the YES side)
+    /// - `no_price`  = 1 - yes_best_ask = 1 - (1 - best_no_bid) = best_no_bid
+    ///
+    /// This ensures the orderbook snapshot/delta path produces the same no_price
+    /// semantics as the ticker path (`no_price = 1 - yes_ask_dollars`).
+    ///
+    /// Returns `None` when either side is empty — emitting a zero price would
+    /// corrupt the price cache and leak phantom spreads into the detector/TUI.
+    fn to_price_update(&self, market_ticker: &str) -> Option<PriceUpdate> {
+        let yes_price = self.best_bid()?;
+        // Derive no_price from the NO bids, consistent with ticker path:
+        // ticker: no_price = 1 - yes_ask_dollars
+        // orderbook: yes_ask = 1 - best_no_bid, so no_price = best_no_bid
+        let no_price = self.best_no_bid()?;
+        Some(PriceUpdate {
             platform: Platform::Kalshi,
             market_id: market_ticker.to_string(),
-            yes_price: self.best_bid(),
-            no_price: self.best_ask(),
+            yes_price,
+            no_price,
             timestamp: chrono::Utc::now(),
-        }
+        })
     }
 }
 
@@ -609,10 +610,20 @@ async fn connect_and_run(
         .await
         .map_err(|e| KalshiError::WebSocket(format!("subscribe send failed: {e}")))?;
 
-    debug!("Kalshi WS subscribed to {} tickers", tickers.len());
+    info!(
+        tickers = ?tickers,
+        count = tickers.len(),
+        "Kalshi WS subscribed to tickers"
+    );
 
     // Maintain local orderbook state for delta processing
     let mut orderbooks: HashMap<String, LocalOrderbook> = HashMap::new();
+
+    // Track which tickers have received at least one price update.
+    // After `silent_ticker_timeout`, warn about any ticker that hasn't received data.
+    let mut tickers_with_data: HashSet<String> = HashSet::new();
+    let silent_ticker_timeout = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut silent_check_done = false;
 
     // Process messages with staleness detection
     let mut last_message_time = tokio::time::Instant::now();
@@ -631,13 +642,13 @@ async fn connect_and_run(
                                     let book = LocalOrderbook::from_snapshot(yes, no);
                                     let update = book.to_price_update(market_ticker);
                                     orderbooks.insert(market_ticker.clone(), book);
-                                    Some(update)
+                                    update
                                 }
                                 KalshiWsMessage::OrderbookDelta { market_ticker, price_dollars, delta_fp, side } => {
                                     if let (Some(price), Some(delta), Some(s)) = (price_dollars.as_ref(), delta_fp.as_ref(), side.as_ref()) {
                                         let book = orderbooks.entry(market_ticker.clone()).or_default();
                                         book.apply_delta(price, delta, s);
-                                        Some(book.to_price_update(market_ticker))
+                                        book.to_price_update(market_ticker)
                                     } else {
                                         None
                                     }
@@ -645,6 +656,7 @@ async fn connect_and_run(
                                 other => ws_message_to_price_update(other),
                             };
                             if let Some(update) = price_update {
+                                tickers_with_data.insert(update.market_id.clone());
                                 if tx.send(update).await.is_err() {
                                     debug!("Kalshi WS receiver dropped, exiting");
                                     return Ok(());
@@ -672,6 +684,30 @@ async fn connect_and_run(
                 }
             }
             _ = tokio::time::sleep(ping_interval) => {
+                // Check for silent tickers once after the timeout period
+                if !silent_check_done && tokio::time::Instant::now() >= silent_ticker_timeout {
+                    silent_check_done = true;
+                    let silent: Vec<&String> = tickers
+                        .iter()
+                        .filter(|t| !tickers_with_data.contains(*t))
+                        .collect();
+                    if !silent.is_empty() {
+                        warn!(
+                            silent_tickers = ?silent,
+                            active_tickers = ?tickers_with_data,
+                            "Kalshi WS: {} of {} tickers received NO data after 30s — \
+                             these may be dead/delisted tickers",
+                            silent.len(),
+                            tickers.len()
+                        );
+                    } else {
+                        info!(
+                            "Kalshi WS: all {} tickers confirmed active (received data within 30s)",
+                            tickers.len()
+                        );
+                    }
+                }
+
                 if last_message_time.elapsed() > stale_timeout {
                     warn!("Kalshi WS stale (no messages for {:?}), reconnecting", stale_timeout);
                     return Err(KalshiError::WebSocket("stale connection".to_string()));
@@ -713,7 +749,11 @@ mod tests {
         assert_eq!(update.platform, Platform::Kalshi);
         assert_eq!(update.market_id, "PRES-2026-DEM");
         assert_eq!(update.yes_price, dec!(0.42));
-        assert_eq!(update.no_price, dec!(0.58));
+        // no_price = best_no_bid = max(0.58, 0.59) = 0.59
+        // This is consistent with ticker path: no_price = 1 - yes_ask
+        // where yes_ask = 1 - best_no_bid = 1 - 0.59 = 0.41
+        // so no_price = 1 - 0.41 = 0.59
+        assert_eq!(update.no_price, dec!(0.59));
     }
 
     #[test]
@@ -922,8 +962,9 @@ mod tests {
             vec![serde_json::Value::String("0.59".into()), serde_json::Value::String("200.00".into())],
         ];
         let book = LocalOrderbook::from_snapshot(&yes, &no);
-        assert_eq!(book.best_bid(), dec!(0.42));
-        assert_eq!(book.best_ask(), dec!(0.58));
+        assert_eq!(book.best_bid(), Some(dec!(0.42)));
+        // best_no_bid = max(0.58, 0.59) = 0.59
+        assert_eq!(book.best_no_bid(), Some(dec!(0.59)));
     }
 
     #[test]
@@ -931,8 +972,8 @@ mod tests {
         let mut book = LocalOrderbook::default();
         book.apply_delta("0.42", "100.00", "yes");
         book.apply_delta("0.58", "100.00", "no");
-        assert_eq!(book.best_bid(), dec!(0.42));
-        assert_eq!(book.best_ask(), dec!(0.58));
+        assert_eq!(book.best_bid(), Some(dec!(0.42)));
+        assert_eq!(book.best_no_bid(), Some(dec!(0.58)));
     }
 
     #[test]
@@ -940,17 +981,19 @@ mod tests {
         let mut book = LocalOrderbook::default();
         book.apply_delta("0.42", "100.00", "yes");
         book.apply_delta("0.43", "50.00", "yes");
-        assert_eq!(book.best_bid(), dec!(0.43));
+        assert_eq!(book.best_bid(), Some(dec!(0.43)));
         // Remove the 0.43 level entirely
         book.apply_delta("0.43", "-50.00", "yes");
-        assert_eq!(book.best_bid(), dec!(0.42));
+        assert_eq!(book.best_bid(), Some(dec!(0.42)));
     }
 
     #[test]
-    fn test_local_orderbook_empty_defaults() {
+    fn test_local_orderbook_empty_returns_none() {
         let book = LocalOrderbook::default();
-        assert_eq!(book.best_bid(), dec!(0));
-        assert_eq!(book.best_ask(), dec!(0));
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_no_bid(), None);
+        // to_price_update should return None when either side is empty
+        assert!(book.to_price_update("EMPTY-MKT").is_none());
     }
 
     #[test]
@@ -958,10 +1001,26 @@ mod tests {
         let mut book = LocalOrderbook::default();
         book.apply_delta("0.45", "100.00", "yes");
         book.apply_delta("0.55", "100.00", "no");
-        let update = book.to_price_update("TEST-MKT");
+        let update = book.to_price_update("TEST-MKT").expect("both sides present");
         assert_eq!(update.platform, Platform::Kalshi);
         assert_eq!(update.market_id, "TEST-MKT");
         assert_eq!(update.yes_price, dec!(0.45));
         assert_eq!(update.no_price, dec!(0.55));
+    }
+
+    #[test]
+    fn test_local_orderbook_one_side_empty_returns_none() {
+        let mut book = LocalOrderbook::default();
+        // Only yes side has levels
+        book.apply_delta("0.45", "100.00", "yes");
+        assert!(book.to_price_update("ONE-SIDE").is_none());
+
+        // Now add no side
+        book.apply_delta("0.55", "100.00", "no");
+        assert!(book.to_price_update("ONE-SIDE").is_some());
+
+        // Remove all no levels
+        book.apply_delta("0.55", "-100.00", "no");
+        assert!(book.to_price_update("ONE-SIDE").is_none());
     }
 }

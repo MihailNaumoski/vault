@@ -46,6 +46,21 @@ teams:
       - name: Code Reviewer
         system_prompt: ./agents/engineering/code-reviewer.md
 
+  trading:
+    color: "#D4AF37"
+    lead:
+      name: Trading Lead
+      system_prompt: ./agents/trading/lead.md
+    members:
+      - name: Rust Engine Dev
+        system_prompt: ./agents/trading/rust-engine-dev.md
+      - name: Quant Strategist
+        system_prompt: ./agents/trading/quant-strategist.md
+      - name: Exchange Connector Dev
+        system_prompt: ./agents/trading/exchange-connector-dev.md
+      - name: Data Analyst
+        system_prompt: ./agents/trading/data-analyst.md
+
   validation:
     color: "#E8633E"
     lead:

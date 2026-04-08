@@ -1,12 +1,17 @@
 use crate::detector::Detector;
 use crate::executor::Executor;
+use crate::fees::FeeConfig;
 use crate::monitor::Monitor;
 use crate::price_cache::PriceCache;
 use crate::tracker::Tracker;
 use crate::types::{EngineConfig, MonitorAction, PairInfo};
 use crate::unwinder::Unwinder;
-use arb_types::{ArbError, PredictionMarketConnector, PriceUpdate};
+use arb_db::models::{DailyPnlRow, NewPriceSnapshot};
+use arb_db::{Repository, SqliteRepository};
+use arb_types::{ArbError, OrderStatus, PredictionMarketConnector, PriceUpdate};
+use chrono::Utc;
 use parking_lot::Mutex;
+use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Semaphore};
@@ -17,12 +22,15 @@ pub struct Engine {
     poly: Arc<dyn PredictionMarketConnector>,
     kalshi: Arc<dyn PredictionMarketConnector>,
     pub price_cache: Arc<PriceCache>,
+    db: Arc<SqliteRepository>,
     detector: Detector,
     executor: Arc<Executor>,
     monitor: Arc<Monitor>,
     tracker: Arc<Tracker>,
     unwinder: Arc<Unwinder>,
     config: EngineConfig,
+    mode: String,
+    fee_config: FeeConfig,
     shutdown_tx: broadcast::Sender<()>,
     execution_semaphore: Arc<Semaphore>,
     executing_pairs: Arc<Mutex<HashSet<Uuid>>>,
@@ -34,24 +42,30 @@ impl Engine {
         poly: Arc<dyn PredictionMarketConnector>,
         kalshi: Arc<dyn PredictionMarketConnector>,
         price_cache: Arc<PriceCache>,
+        db: Arc<SqliteRepository>,
         executor: Executor,
         monitor: Monitor,
         tracker: Tracker,
         unwinder: Unwinder,
         config: EngineConfig,
+        mode: String,
+        fee_config: FeeConfig,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
-        let detector = Detector::new(price_cache.clone(), &config);
+        let detector = Detector::new(price_cache.clone(), &config, &fee_config);
         Self {
             poly,
             kalshi,
             price_cache,
+            db,
             detector,
             executor: Arc::new(executor),
             monitor: Arc::new(monitor),
             tracker: Arc::new(tracker),
             unwinder: Arc::new(unwinder),
             config,
+            mode,
+            fee_config,
             shutdown_tx,
             execution_semaphore: Arc::new(Semaphore::new(2)),
             executing_pairs: Arc::new(Mutex::new(HashSet::new())),
@@ -67,6 +81,8 @@ impl Engine {
         let mut scan_timer = tokio::time::interval(std::time::Duration::from_millis(
             self.config.scan_interval_ms,
         ));
+        let mut snapshot_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut pnl_timer = tokio::time::interval(std::time::Duration::from_secs(60));
         info!(pairs = pairs.len(), "engine started");
 
         loop {
@@ -103,6 +119,12 @@ impl Engine {
                         });
                     }
                 }
+                _ = snapshot_timer.tick() => {
+                    self.capture_price_snapshots(&pairs).await;
+                }
+                _ = pnl_timer.tick() => {
+                    self.aggregate_daily_pnl().await;
+                }
                 _ = shutdown_rx.recv() => {
                     info!("shutdown signal");
                     break;
@@ -127,6 +149,10 @@ impl Engine {
                         poly_order,
                         kalshi_order,
                     }) => {
+                        // Update order statuses in DB
+                        self.update_order_in_db(opp.id, &poly_order).await;
+                        self.update_order_in_db(opp.id, &kalshi_order).await;
+
                         if let Err(e) = self
                             .tracker
                             .create_position(opp, &poly_order, &kalshi_order)
@@ -140,15 +166,23 @@ impl Engine {
                         filled_order,
                         unfilled_order_id,
                     }) => {
+                        // Update filled order status in DB
+                        self.update_order_in_db(opp.id, &filled_order).await;
+                        // Mark unfilled order as cancelled in DB
+                        self.cancel_order_in_db(opp.id, &unfilled_order_id).await;
+
                         if let Err(e) = self
                             .unwinder
-                            .unwind(filled_platform, &filled_order, &unfilled_order_id)
+                            .unwind(filled_platform, &filled_order, &unfilled_order_id, None)
                             .await
                         {
                             error!(opp = %opp.id, err = %e, "unwind failed");
                         }
                     }
                     Ok(MonitorAction::BothCancelled) => {
+                        // Mark both orders as cancelled in DB
+                        self.cancel_order_in_db(opp.id, &result.poly_order.order_id).await;
+                        self.cancel_order_in_db(opp.id, &result.kalshi_order.order_id).await;
                         info!(opp = %opp.id, "both expired");
                     }
                     Ok(_) => {}
@@ -156,6 +190,155 @@ impl Engine {
                 }
             }
             Err(e) => warn!(opp = %opp.id, err = %e, "execution failed"),
+        }
+    }
+
+    /// Update an order's status in the database after the monitor reports its final state.
+    async fn update_order_in_db(&self, opp_id: Uuid, order: &arb_types::OrderResponse) {
+        let orders = match self.db.list_orders_by_opportunity(&opp_id).await {
+            Ok(orders) => orders,
+            Err(e) => {
+                error!(opp = %opp_id, err = %e, "failed to list orders for status update");
+                return;
+            }
+        };
+        // Match by platform_order_id
+        if let Some(db_order) = orders.iter().find(|o| {
+            o.platform_order_id.as_deref() == Some(&order.order_id)
+        }) {
+            let id = match db_order.id.parse::<Uuid>() {
+                Ok(id) => id,
+                Err(_) => return,
+            };
+            let status = format!("{:?}", order.status).to_lowercase();
+            let filled_at = if order.status == OrderStatus::Filled {
+                Some(Utc::now())
+            } else {
+                None
+            };
+            if let Err(e) = self.db.update_order_status(
+                &id,
+                &status,
+                order.filled_quantity as i64,
+                filled_at,
+                None,
+                None,
+            ).await {
+                error!(order_id = %order.order_id, err = %e, "failed to update order status");
+            }
+        }
+    }
+
+    /// Mark an order as cancelled in the database by its platform order ID.
+    async fn cancel_order_in_db(&self, opp_id: Uuid, platform_order_id: &str) {
+        let orders = match self.db.list_orders_by_opportunity(&opp_id).await {
+            Ok(orders) => orders,
+            Err(e) => {
+                error!(opp = %opp_id, err = %e, "failed to list orders for cancel update");
+                return;
+            }
+        };
+        if let Some(db_order) = orders.iter().find(|o| {
+            o.platform_order_id.as_deref() == Some(platform_order_id)
+        }) {
+            let id = match db_order.id.parse::<Uuid>() {
+                Ok(id) => id,
+                Err(_) => return,
+            };
+            if let Err(e) = self.db.update_order_status(
+                &id,
+                "cancelled",
+                db_order.filled_quantity,
+                None,
+                Some(Utc::now()),
+                Some("monitor_timeout"),
+            ).await {
+                error!(order_id = platform_order_id, err = %e, "failed to cancel order in db");
+            }
+        }
+    }
+
+    /// Capture price snapshots for all active pairs.
+    async fn capture_price_snapshots(&self, pairs: &[PairInfo]) {
+        for pair in pairs {
+            if let Some(pp) = self.price_cache.get(&pair.pair_id) {
+                // Skip pairs with no price data yet
+                if pp.poly_yes == Decimal::ZERO || pp.kalshi_yes == Decimal::ZERO {
+                    continue;
+                }
+                let spread = pp.poly_yes - pp.kalshi_yes;
+                let snapshot = NewPriceSnapshot {
+                    pair_id: pair.pair_id,
+                    poly_yes_price: pp.poly_yes,
+                    kalshi_yes_price: pp.kalshi_yes,
+                    spread,
+                    captured_at: Utc::now(),
+                };
+                if let Err(e) = self.db.insert_price_snapshot(&snapshot).await {
+                    error!(pair = %pair.pair_id, err = %e, "failed to insert price snapshot");
+                }
+            }
+        }
+    }
+
+    /// Aggregate daily P&L from filled orders and open positions.
+    async fn aggregate_daily_pnl(&self) {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+
+        // Count executed orders (all orders placed today)
+        let mut all_orders_count = 0i64;
+        for status in &["open", "pending", "partial_fill", "filled", "cancelled", "failed"] {
+            if let Ok(orders) = self.db.list_orders_by_status(status).await {
+                all_orders_count += orders.len() as i64;
+            }
+        }
+        let filled_orders = self.db.list_orders_by_status("filled").await.unwrap_or_default();
+        let trades_executed = all_orders_count;
+        let trades_filled = filled_orders.len() as i64;
+
+        // Sum profit from open positions filtered by current mode
+        let positions = self.db.list_positions_by_mode(&self.mode).await.unwrap_or_default();
+
+        // guaranteed_profit already has fees deducted (net profit per position)
+        let net_profit_from_positions: Decimal = positions.iter()
+            .map(|p| p.guaranteed_profit)
+            .sum();
+
+        // Compute total fees from positions
+        let total_fees: Decimal = positions.iter()
+            .map(|p| {
+                let (_k, _p, fee) = self.fee_config.compute_fees(
+                    p.kalshi_avg_price,
+                    p.poly_avg_price,
+                    p.hedged_quantity as u32,
+                );
+                fee
+            })
+            .sum();
+
+        let gross_profit = net_profit_from_positions + total_fees;
+
+        // Capital deployed = sum of all position costs
+        let capital_deployed: Decimal = positions.iter()
+            .map(|p| {
+                p.poly_avg_price * Decimal::from(p.poly_quantity)
+                    + p.kalshi_avg_price * Decimal::from(p.kalshi_quantity)
+            })
+            .sum();
+
+        let pnl = DailyPnlRow {
+            date: today,
+            mode: self.mode.clone(),
+            trades_executed,
+            trades_filled,
+            gross_profit,
+            fees_paid: total_fees,
+            net_profit: net_profit_from_positions,
+            capital_deployed,
+        };
+
+        if let Err(e) = self.db.upsert_daily_pnl(&pnl).await {
+            error!(err = %e, "failed to upsert daily P&L");
         }
     }
 
@@ -180,6 +363,7 @@ mod tests {
     mod with_mocks {
         use crate::engine::*;
         use crate::executor::Executor;
+        use crate::fees::FeeConfig;
         use crate::tracker::Tracker;
         use crate::types::OrderConfig;
         use arb_db::SqliteRepository;
@@ -247,7 +431,7 @@ mod tests {
             let rm = Arc::new(RwLock::new(RiskManager::new(RiskConfig::default())));
             rm.write().set_engine_running(true);
 
-            let executor = Executor::new(poly, kalshi, rm, db, order_config());
+            let executor = Executor::new(poly, kalshi, rm, db, order_config(), "paper".into());
 
             let mut opp = Opportunity {
                 id: Uuid::now_v7(),
@@ -338,7 +522,7 @@ mod tests {
             let rm = Arc::new(RwLock::new(RiskManager::new(RiskConfig::default())));
             rm.write().set_engine_running(true);
 
-            let executor = Executor::new(poly, kalshi, rm, db, order_config());
+            let executor = Executor::new(poly, kalshi, rm, db, order_config(), "paper".into());
 
             let mut opp = Opportunity {
                 id: Uuid::now_v7(),
@@ -371,7 +555,12 @@ mod tests {
             let rm = Arc::new(RwLock::new(RiskManager::new(RiskConfig::default())));
             rm.write().set_engine_running(true);
 
-            let tracker = Tracker::new(db, rm.clone());
+            // Use zero fees so the tracker test's profit assertion stays unchanged
+            let fee_config = FeeConfig {
+                kalshi_taker_fee_pct: dec!(0),
+                poly_taker_fee_pct: dec!(0),
+            };
+            let tracker = Tracker::new(db, rm.clone(), "paper".into(), fee_config);
 
             let opp = Opportunity {
                 id: Uuid::now_v7(),

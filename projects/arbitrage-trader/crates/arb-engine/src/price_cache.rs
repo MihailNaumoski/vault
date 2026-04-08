@@ -36,6 +36,17 @@ impl PriceCache {
             pair_id,
         );
         mapping.insert((Platform::Kalshi, kalshi_market_id.to_string()), pair_id);
+
+        // Seed initial entry so TUI shows pairs immediately (with zero prices until first update)
+        let mut prices = self.prices.write();
+        prices.entry(pair_id).or_insert_with(|| PricePair {
+            poly_yes: Decimal::ZERO,
+            poly_no: Decimal::ZERO,
+            kalshi_yes: Decimal::ZERO,
+            kalshi_no: Decimal::ZERO,
+            poly_updated: Utc::now(),
+            kalshi_updated: Utc::now(),
+        });
     }
 
     pub fn update(&self, update: &PriceUpdate) -> Option<Uuid> {

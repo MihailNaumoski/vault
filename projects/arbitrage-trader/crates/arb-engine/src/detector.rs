@@ -1,3 +1,4 @@
+use crate::fees::FeeConfig;
 use crate::price_cache::PriceCache;
 use crate::types::{EngineConfig, PairInfo};
 use arb_types::order::Side;
@@ -13,15 +14,17 @@ pub struct Detector {
     price_cache: Arc<PriceCache>,
     min_spread_pct: Decimal,
     min_spread_absolute: Decimal,
+    fee_config: FeeConfig,
     max_staleness: Duration,
 }
 
 impl Detector {
-    pub fn new(price_cache: Arc<PriceCache>, config: &EngineConfig) -> Self {
+    pub fn new(price_cache: Arc<PriceCache>, config: &EngineConfig, fee_config: &FeeConfig) -> Self {
         Self {
             price_cache,
             min_spread_pct: config.min_spread_pct,
             min_spread_absolute: config.min_spread_absolute,
+            fee_config: fee_config.clone(),
             max_staleness: Duration::from_secs(30),
         }
     }
@@ -38,6 +41,17 @@ impl Detector {
         let prices = self.price_cache.get(&pair.pair_id)?;
 
         if !self.price_cache.is_fresh(&pair.pair_id, self.max_staleness) {
+            return None;
+        }
+
+        // Guard: reject any price that is zero — zero prices are always data errors
+        // (e.g. missing WS data defaulting to 0) and would produce phantom spreads
+        // like spread = 1 - 0.52 - 0 = 0.48 which are entirely fictitious.
+        if prices.poly_yes.is_zero()
+            || prices.poly_no.is_zero()
+            || prices.kalshi_yes.is_zero()
+            || prices.kalshi_no.is_zero()
+        {
             return None;
         }
 
@@ -62,7 +76,10 @@ impl Detector {
             )
         };
 
-        if spread < self.min_spread_absolute {
+        // Fee-adjusted minimum: a spread must exceed base threshold + estimated fees
+        let estimated_fees = self.fee_config.estimated_round_trip_fee(kalshi_price, poly_price);
+        let effective_min_spread = self.min_spread_absolute + estimated_fees;
+        if spread < effective_min_spread {
             return None;
         }
 
@@ -98,6 +115,7 @@ impl Detector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fees::FeeConfig;
     use arb_types::{Platform, PriceUpdate};
     use chrono::Duration as CDur;
     use rust_decimal_macros::dec;
@@ -107,6 +125,14 @@ mod tests {
             scan_interval_ms: 1000,
             min_spread_pct: pct,
             min_spread_absolute: abs,
+        }
+    }
+
+    /// Zero-fee config for tests that want to keep legacy behavior
+    fn zero_fees() -> FeeConfig {
+        FeeConfig {
+            kalshi_taker_fee_pct: dec!(0),
+            poly_taker_fee_pct: dec!(0),
         }
     }
 
@@ -153,7 +179,7 @@ mod tests {
         let pid = Uuid::now_v7();
         let cache = Arc::new(PriceCache::new());
         fill_cache(&cache, pid, dec!(0.42), dec!(0.58), dec!(0.47), dec!(0.53));
-        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
         let opps = d.scan(&[pair_info(pid)]);
         assert_eq!(opps.len(), 1);
         assert_eq!(opps[0].spread, dec!(0.05));
@@ -166,7 +192,7 @@ mod tests {
         let pid = Uuid::now_v7();
         let cache = Arc::new(PriceCache::new());
         fill_cache(&cache, pid, dec!(0.50), dec!(0.50), dec!(0.51), dec!(0.49));
-        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
         assert!(d.scan(&[pair_info(pid)]).is_empty());
     }
 
@@ -175,7 +201,7 @@ mod tests {
         let pid = Uuid::now_v7();
         let cache = Arc::new(PriceCache::new());
         fill_cache(&cache, pid, dec!(0.42), dec!(0.58), dec!(0.47), dec!(0.53));
-        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
         let opps = d.scan(&[pair_info(pid)]);
         assert_eq!(opps[0].poly_side, Side::Yes);
     }
@@ -185,7 +211,7 @@ mod tests {
         let pid = Uuid::now_v7();
         let cache = Arc::new(PriceCache::new());
         fill_cache(&cache, pid, dec!(0.42), dec!(0.58), dec!(0.47), dec!(0.53));
-        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
         let mut pi = pair_info(pid);
         pi.verified = false;
         assert!(d.scan(&[pi]).is_empty());
@@ -194,7 +220,51 @@ mod tests {
     #[test]
     fn test_empty_pairs() {
         let cache = Arc::new(PriceCache::new());
-        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
         assert!(d.scan(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_rejects_zero_kalshi_no_price() {
+        // Regression: zero kalshi_no creates phantom spread = 1 - poly_yes - 0
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.50), dec!(0.50), dec!(0.48), dec!(0));
+        let d = Detector::new(cache, &cfg(dec!(1.0), dec!(0.01)), &zero_fees());
+        assert!(d.scan(&[pair_info(pid)]).is_empty());
+    }
+
+    #[test]
+    fn test_rejects_zero_kalshi_yes_price() {
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.50), dec!(0.50), dec!(0), dec!(0.52));
+        let d = Detector::new(cache, &cfg(dec!(1.0), dec!(0.01)), &zero_fees());
+        assert!(d.scan(&[pair_info(pid)]).is_empty());
+    }
+
+    #[test]
+    fn test_rejects_zero_poly_price() {
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0), dec!(0.50), dec!(0.48), dec!(0.52));
+        let d = Detector::new(cache, &cfg(dec!(1.0), dec!(0.01)), &zero_fees());
+        assert!(d.scan(&[pair_info(pid)]).is_empty());
+    }
+
+    #[test]
+    fn test_fee_adjusted_threshold_rejects_unprofitable() {
+        // Spread of 5 cents looks good with 2 cent threshold,
+        // but with 7% Kalshi fees on 0.53 price = 0.0371 per contract,
+        // effective min = 0.02 + 0.0371 = 0.0571 > 0.05 spread → rejected
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.42), dec!(0.58), dec!(0.47), dec!(0.53));
+        let fees = FeeConfig {
+            kalshi_taker_fee_pct: dec!(7.0),
+            poly_taker_fee_pct: dec!(0.0),
+        };
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &fees);
+        assert!(d.scan(&[pair_info(pid)]).is_empty());
     }
 }

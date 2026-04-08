@@ -1,0 +1,14 @@
+-- Migration 003: Add trading mode column to distinguish paper/demo/production trades.
+-- Default 'paper' ensures all existing rows are correctly tagged.
+--
+-- NOTE: This migration is applied programmatically in repo.rs to handle
+-- SQLite's lack of "ADD COLUMN IF NOT EXISTS".  The raw SQL here serves
+-- as documentation of the schema change.
+--
+-- Columns added:
+--   opportunities.mode  TEXT NOT NULL DEFAULT 'paper'
+--   orders.mode         TEXT NOT NULL DEFAULT 'paper'
+--   positions.mode      TEXT NOT NULL DEFAULT 'paper'
+--   daily_pnl.mode      TEXT NOT NULL DEFAULT 'paper'
+--
+-- daily_pnl primary key changed from (date) to (date, mode).

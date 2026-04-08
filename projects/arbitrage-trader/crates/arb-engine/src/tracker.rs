@@ -1,3 +1,4 @@
+use crate::fees::FeeConfig;
 use arb_db::models::PositionRow;
 use arb_db::{Repository, SqliteRepository};
 use arb_risk::RiskManager;
@@ -12,11 +13,33 @@ use uuid::Uuid;
 pub struct Tracker {
     db: Arc<SqliteRepository>,
     risk_manager: Arc<RwLock<RiskManager>>,
+    mode: String,
+    fee_config: FeeConfig,
 }
 
 impl Tracker {
-    pub fn new(db: Arc<SqliteRepository>, risk_manager: Arc<RwLock<RiskManager>>) -> Self {
-        Self { db, risk_manager }
+    pub fn new(
+        db: Arc<SqliteRepository>,
+        risk_manager: Arc<RwLock<RiskManager>>,
+        mode: String,
+        fee_config: FeeConfig,
+    ) -> Self {
+        Self {
+            db,
+            risk_manager,
+            mode,
+            fee_config,
+        }
+    }
+
+    /// Returns the trading mode this tracker writes to the DB.
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    /// Returns a reference to the fee configuration.
+    pub fn fee_config(&self) -> &FeeConfig {
+        &self.fee_config
     }
 
     pub async fn create_position(
@@ -28,7 +51,15 @@ impl Tracker {
         let hedged = poly_order.filled_quantity.min(kalshi_order.filled_quantity);
         let unhedged =
             (poly_order.filled_quantity as i32) - (kalshi_order.filled_quantity as i32);
-        let profit = opp.spread * Decimal::from(hedged);
+        let gross_profit = opp.spread * Decimal::from(hedged);
+
+        // Compute fees
+        let (_kalshi_fee, _poly_fee, total_fee) = self.fee_config.compute_fees(
+            kalshi_order.price,
+            poly_order.price,
+            hedged,
+        );
+        let net_profit = gross_profit - total_fee;
 
         let position = Position {
             id: Uuid::now_v7(),
@@ -41,7 +72,7 @@ impl Tracker {
             kalshi_avg_price: kalshi_order.price,
             hedged_quantity: hedged,
             unhedged_quantity: unhedged,
-            guaranteed_profit: profit,
+            guaranteed_profit: net_profit,
             status: PositionStatus::Open,
             opened_at: Utc::now(),
             settled_at: None,
@@ -62,6 +93,7 @@ impl Tracker {
             status: "open".into(),
             opened_at: position.opened_at,
             settled_at: None,
+            mode: self.mode.clone(),
         };
         if let Err(e) = self.db.insert_position(&row).await {
             error!(pos = %position.id, err = %e, "persist position failed");
@@ -74,7 +106,15 @@ impl Tracker {
             .exposure_mut()
             .add_position(opp.pair_id, capital);
 
-        info!(pos = %position.id, profit = %profit, hedged, "position created");
+        info!(
+            pos = %position.id,
+            gross_profit = %gross_profit,
+            fees = %total_fee,
+            net_profit = %net_profit,
+            hedged,
+            mode = %self.mode,
+            "position created"
+        );
         Ok(position)
     }
 }

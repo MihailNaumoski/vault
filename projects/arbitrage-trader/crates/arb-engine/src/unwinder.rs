@@ -1,14 +1,19 @@
+use arb_db::{Repository, SqliteRepository};
+use arb_db::models::UnwindEventRow;
 use arb_risk::RiskManager;
 use arb_types::{ArbError, LimitOrderRequest, OrderResponse, Platform, PredictionMarketConnector};
+use chrono::Utc;
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 pub struct Unwinder {
     poly: Arc<dyn PredictionMarketConnector>,
     kalshi: Arc<dyn PredictionMarketConnector>,
     risk_manager: Arc<RwLock<RiskManager>>,
+    db: Arc<SqliteRepository>,
 }
 
 impl Unwinder {
@@ -16,11 +21,13 @@ impl Unwinder {
         poly: Arc<dyn PredictionMarketConnector>,
         kalshi: Arc<dyn PredictionMarketConnector>,
         risk_manager: Arc<RwLock<RiskManager>>,
+        db: Arc<SqliteRepository>,
     ) -> Self {
         Self {
             poly,
             kalshi,
             risk_manager,
+            db,
         }
     }
 
@@ -29,6 +36,7 @@ impl Unwinder {
         filled_platform: Platform,
         filled_order: &OrderResponse,
         unfilled_order_id: &str,
+        position_id: Option<String>,
     ) -> Result<Decimal, ArbError> {
         let (filled_conn, unfilled_conn): (
             &dyn PredictionMarketConnector,
@@ -76,12 +84,31 @@ impl Unwinder {
         let entry_cost = filled_order.price * Decimal::from(filled_order.filled_quantity);
         let exit_value = best_bid.price * Decimal::from(filled_order.filled_quantity);
         let loss = (entry_cost - exit_value).max(Decimal::ZERO);
+        let slippage = filled_order.price - best_bid.price;
 
         self.risk_manager
             .write()
             .exposure_mut()
             .record_unwind_loss(loss);
-        warn!(platform = %filled_platform, loss = %loss, "unwind complete");
+
+        // 4. Persist unwind event to database
+        let event = UnwindEventRow {
+            id: Uuid::now_v7().to_string(),
+            position_id,
+            platform: filled_platform.to_string(),
+            order_id: Some(filled_order.order_id.clone()),
+            entry_price: filled_order.price,
+            exit_price: best_bid.price,
+            quantity: filled_order.filled_quantity as i64,
+            slippage,
+            loss,
+            unwound_at: Utc::now(),
+        };
+        if let Err(e) = self.db.insert_unwind_event(&event).await {
+            error!(err = %e, "failed to persist unwind event");
+        }
+
+        warn!(platform = %filled_platform, loss = %loss, slippage = %slippage, "unwind complete");
         Ok(loss)
     }
 }

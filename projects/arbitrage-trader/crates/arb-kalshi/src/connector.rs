@@ -196,17 +196,39 @@ fn convert_market_response(m: KalshiMarketResponse) -> Market {
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(Utc::now);
 
-    // Prefer dollar string fields when available, fall back to cents
+    // Prefer dollar string fields when available, fall back to cents.
+    //
+    // SEMANTICS: yes_price = cost to acquire a YES contract = yes_bid (what you pay).
+    // no_price = cost to acquire a NO contract.  The correct derivation is:
+    //   no_price = 1 - yes_ask  (selling a YES at ask is equivalent to buying NO)
+    // Using no_bid directly is WRONG because yes_bid + no_bid < 1 always (market maker
+    // edge creates a permanent gap that looks like a phantom spread).
+    // Fallback: if yes_ask is unavailable, use no_bid as a degraded estimate.
     let yes_price = m
         .yes_bid_dollars
         .as_ref()
         .and_then(|s| s.parse::<Decimal>().ok())
         .unwrap_or_else(|| price::kalshi_cents_to_decimal(m.yes_bid));
     let no_price = m
-        .no_bid_dollars
+        .yes_ask_dollars
         .as_ref()
         .and_then(|s| s.parse::<Decimal>().ok())
-        .unwrap_or_else(|| price::kalshi_cents_to_decimal(m.no_bid));
+        .map(|ask| dec!(1) - ask)
+        .or_else(|| {
+            if m.yes_ask > 0 {
+                Some(dec!(1) - price::kalshi_cents_to_decimal(m.yes_ask))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            // Degraded fallback: no_bid is inaccurate (yes_bid + no_bid < 1) but
+            // better than nothing when ask data is missing.
+            m.no_bid_dollars
+                .as_ref()
+                .and_then(|s| s.parse::<Decimal>().ok())
+                .unwrap_or_else(|| price::kalshi_cents_to_decimal(m.no_bid))
+        });
     let volume = m
         .volume_fp
         .as_ref()
@@ -380,7 +402,7 @@ mod tests {
         assert_eq!(market.platform_id, "PRES-2026-DEM");
         // yes_price should be 0.53 (from yes_bid cents), not 53
         assert_eq!(market.yes_price, dec!(0.53));
-        // no_price should be 0.45 (from no_bid cents), not 45
+        // no_price should be 0.45 (from 1 - yes_ask cents fallback), not 45
         assert_eq!(market.no_price, dec!(0.45));
         assert_eq!(market.status, MarketStatus::Open);
     }

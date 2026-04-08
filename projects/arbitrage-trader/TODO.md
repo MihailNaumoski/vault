@@ -12,6 +12,23 @@
 - [ ] **Add POLY_ADDRESS header to auth.rs** — Polymarket CLOB authenticated endpoints require a POLY_ADDRESS header (wallet address). Missing — needed for live order placement.
 - [ ] **Set production risk config values** — `min_book_depth=0` and `min_time_to_close_hours=1` are dev workarounds. Set proper values before live trading.
 
+## Paper Trading with Real Exchange Sandboxes
+
+- [ ] **Kalshi demo sandbox integration** — Kalshi offers a demo environment at `demo-api.kalshi.co` with a real matching engine and fake money. Add a `--paper-kalshi-demo` flag (or config option) that points the Kalshi connector at the demo URL instead of production. This gives realistic order execution — your orders hit their order book, get matched against real liquidity, and you see real fills/rejects. Steps to test:
+  1. Create a Kalshi account and get demo API credentials (separate from production)
+  2. Set `kalshi.base_url = "https://demo-api.kalshi.co"` in config or via CLI flag
+  3. Use the real `KalshiConnector` (not `PaperConnector`) pointed at the demo URL
+  4. Run `cargo run -- --tui` (no `--paper` flag needed — the demo endpoint IS the sandbox)
+  5. Monitor order placement, fills, cancellations, and balance changes in the TUI
+  6. Verify: auth works with demo credentials, order lifecycle completes, risk checks fire correctly
+
+- [ ] **Polymarket — no sandbox available** — Polymarket runs on-chain (Polygon mainnet) with no paper trading endpoint. The CLOB has no testnet deployment. Options:
+  - **Current approach (keep):** `PaperConnector` wraps the real Polymarket connector — live prices, simulated fills locally. This is the best we can do without risking real money.
+  - **Future option:** Deploy against Polygon Amoy testnet, but Polymarket's CLOB contracts aren't deployed there, so order matching won't work. Only useful for testing the signing/auth flow, not actual trading.
+  - **Hybrid approach (recommended):** Use Kalshi demo for real sandbox execution + Polymarket `PaperConnector` for simulated fills. This tests the full arbitrage pipeline with one real leg and one simulated leg.
+
+- [ ] **Combined hybrid paper mode** — Add a mode where Kalshi uses the real demo sandbox and Polymarket uses `PaperConnector`. This is the most realistic test setup possible given exchange limitations. The engine runs normally — detector finds spreads, executor places both legs — but Kalshi orders are real (demo) while Polymarket orders are simulated.
+
 ## Medium Priority
 
 - [ ] **Add continuous market scanning** — Currently seeds markets once on startup. Add periodic scanning (every 5 min) to discover new markets, remove closed ones, update token IDs.

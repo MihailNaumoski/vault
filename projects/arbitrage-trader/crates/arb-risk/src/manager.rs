@@ -46,6 +46,9 @@ pub enum RiskError {
 
     #[error("insufficient book depth: {available} contracts, need {min}")]
     InsufficientLiquidity { available: u32, min: u32 },
+
+    #[error("unwind rate {current}% exceeds max {max}%")]
+    UnwindRateTooHigh { current: Decimal, max: Decimal },
 }
 
 /// Risk manager that performs pre-trade checks based on configured limits.
@@ -187,6 +190,15 @@ impl RiskManager {
             });
         }
 
+        // 11. Unwind rate not too high (stops trading if too many trades are unwinding)
+        let unwind_rate = self.exposure.unwind_rate_pct();
+        if unwind_rate > self.config.max_unwind_rate_pct {
+            return Err(RiskError::UnwindRateTooHigh {
+                current: unwind_rate,
+                max: self.config.max_unwind_rate_pct,
+            });
+        }
+
         Ok(())
     }
 }
@@ -324,6 +336,23 @@ mod tests {
         let (pid, ver, spread, min_s, ct, qty, pp, kp, pb, kb, _bd) = valid_params();
         let err = m.pre_trade_check(pid, ver, spread, min_s, ct, qty, pp, kp, pb, kb, 5).unwrap_err();
         assert!(matches!(err, RiskError::InsufficientLiquidity { .. }));
+    }
+
+    #[test]
+    fn test_unwind_rate_too_high() {
+        let mut m = running_manager();
+        // Simulate 5 trades, 2 of which required unwinding (40% rate > 20% max)
+        for _ in 0..5 {
+            m.exposure_mut().add_position(Uuid::now_v7(), dec!(10.00));
+        }
+        m.exposure_mut().record_unwind_loss(dec!(1.00));
+        m.exposure_mut().record_unwind_loss(dec!(1.00));
+        // unwind_count=2, total_trades=7 (5 add_position + 2 record_unwind_loss)
+        // Actually: add_position increments total_trades_today, record_unwind_loss increments unwind_count
+        // So: total_trades_today=5, unwind_count=2 => rate=40%
+        let (pid, ver, spread, min_s, ct, qty, pp, kp, pb, kb, bd) = valid_params();
+        let err = m.pre_trade_check(pid, ver, spread, min_s, ct, qty, pp, kp, pb, kb, bd).unwrap_err();
+        assert!(matches!(err, RiskError::UnwindRateTooHigh { .. }));
     }
 
     #[test]

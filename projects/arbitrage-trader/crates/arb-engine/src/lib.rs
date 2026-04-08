@@ -2,6 +2,7 @@ pub mod types;
 pub mod price_cache;
 pub mod detector;
 pub mod executor;
+pub mod fees;
 pub mod monitor;
 pub mod unwinder;
 pub mod tracker;

@@ -49,7 +49,7 @@ You own code quality, implementation decisions, and delivery for the engineering
 | **Backend Dev** | APIs, business logic, data models, backend tests, database queries | When spec includes server-side changes |
 | **Frontend Dev** | UI components, state management, routing, client-side logic, frontend tests | When spec includes client-side changes |
 | **Playwright Tester** | E2E test writing and execution covering spec acceptance criteria | Always — after Backend Dev and Frontend Dev complete |
-| **Code Reviewer** | Quality review of all code produced this phase; writes `review.md` | Always — after Playwright Tester completes |
+| **Code Reviewer** | Quality review of all code produced this phase; writes `review.md` | Always — after Playwright Tester completes, OR on cross-team review requests |
 
 ### Mandatory Sequencing
 
@@ -192,6 +192,17 @@ The Engineering Lead's report to the orchestrator must include ALL sections of t
 7. Rework Fixes Applied (if applicable)
 
 The Engineering Lead does NOT write to `phases/` directly. It delivers a structured verbal report; the orchestrator writes the file.
+
+## Cross-Team Code Reviews
+
+The orchestrator may request code reviews for the **Trading team's** output. When this happens:
+
+1. Receive the review request with: list of changed files, what was built, acceptance criteria
+2. Delegate ONLY to **Code Reviewer** — no other workers needed
+3. Code Reviewer writes review to `projects/arbitrage-trader/docs/review/{description}-review.md`
+4. Report the Code Reviewer's decision (APPROVE / REWORK / BLOCK) back to orchestrator
+
+The orchestrator routes REWORK findings back to the Trading Lead for fixes.
 
 ## Rules
 - NEVER edit files, run commands, or execute anything yourself

@@ -17,9 +17,13 @@ max_position_per_market = "1000.00"
 max_total_exposure = "10000.00"
 max_unhedged_exposure = "500.00"
 max_daily_loss = "200.00"
-min_time_to_close_hours = 1
-min_book_depth = 0
+min_time_to_close_hours = 24
+min_book_depth = 50
 max_unwind_rate_pct = "20.0"
+
+[fees]
+kalshi_taker_fee_pct = "7.0"
+poly_taker_fee_pct = "0.0"
 
 [polymarket]
 clob_url = "https://clob.polymarket.com"
@@ -27,8 +31,10 @@ gamma_url = "https://gamma-api.polymarket.com"
 ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 [kalshi]
-api_url = "https://trading-api.kalshi.com/trade-api/v2"
-ws_url = "wss://trading-api.kalshi.com/trade-api/ws/v2"
+base_url = "https://api.elections.kalshi.com/trade-api/v2"
+ws_url = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+demo_base_url = "https://demo-api.kalshi.co/trade-api/v2"
+demo_ws_url = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
 [database]
 path = "data/arb.db"

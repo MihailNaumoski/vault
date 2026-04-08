@@ -46,6 +46,7 @@ pub trait Repository: Send + Sync {
     async fn insert_position(&self, position: &PositionRow) -> anyhow::Result<()>;
     async fn get_position(&self, id: &Uuid) -> anyhow::Result<Option<PositionRow>>;
     async fn list_open_positions(&self) -> anyhow::Result<Vec<PositionRow>>;
+    async fn list_positions_by_mode(&self, mode: &str) -> anyhow::Result<Vec<PositionRow>>;
     async fn update_position_status(
         &self,
         id: &Uuid,
@@ -69,6 +70,9 @@ pub trait Repository: Send + Sync {
         from: NaiveDate,
         to: NaiveDate,
     ) -> anyhow::Result<Vec<DailyPnlRow>>;
+
+    // Unwind events
+    async fn insert_unwind_event(&self, event: &UnwindEventRow) -> anyhow::Result<()>;
 }
 
 /// SQLite implementation of the Repository trait.
@@ -85,11 +89,64 @@ impl SqliteRepository {
         Ok(Self { pool })
     }
 
-    /// Run migrations from the SQL file at runtime.
+    /// Run migrations from the SQL files at runtime.
     pub async fn run_migrations(&self) -> anyhow::Result<()> {
         let schema = include_str!("../../../migrations/001_initial_schema.sql");
         sqlx::raw_sql(schema).execute(&self.pool).await?;
+        let unwind_events = include_str!("../../../migrations/002_unwind_events.sql");
+        sqlx::raw_sql(unwind_events).execute(&self.pool).await?;
+
+        // Migration 003: add mode column (idempotent — checks if column exists first)
+        self.run_migration_003().await?;
+
         tracing::info!("Database migrations applied");
+        Ok(())
+    }
+
+    /// Migration 003: Add `mode` column to opportunities, orders, positions, daily_pnl.
+    /// Recreates daily_pnl with composite primary key (date, mode).
+    /// Idempotent — safe to run multiple times.
+    async fn run_migration_003(&self) -> anyhow::Result<()> {
+        // Helper: check if a column exists in a table
+        async fn has_column(pool: &SqlitePool, table: &str, column: &str) -> bool {
+            let query = format!("PRAGMA table_info({})", table);
+            let rows = sqlx::query(&query).fetch_all(pool).await.unwrap_or_default();
+            rows.iter().any(|r| {
+                let name: &str = r.get("name");
+                name == column
+            })
+        }
+
+        // Add mode column to tables that don't have it yet
+        for table in &["opportunities", "orders", "positions"] {
+            if !has_column(&self.pool, table, "mode").await {
+                let sql = format!("ALTER TABLE {} ADD COLUMN mode TEXT NOT NULL DEFAULT 'paper'", table);
+                sqlx::query(&sql).execute(&self.pool).await?;
+            }
+        }
+
+        // For daily_pnl, we need to check if it has mode AND has the composite PK.
+        // If mode column is missing, we need to recreate the table with (date, mode) PK.
+        if !has_column(&self.pool, "daily_pnl", "mode").await {
+            sqlx::raw_sql(
+                "CREATE TABLE IF NOT EXISTS daily_pnl_new (
+                    date TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'paper',
+                    trades_executed INTEGER NOT NULL DEFAULT 0,
+                    trades_filled INTEGER NOT NULL DEFAULT 0,
+                    gross_profit TEXT NOT NULL DEFAULT '0',
+                    fees_paid TEXT NOT NULL DEFAULT '0',
+                    net_profit TEXT NOT NULL DEFAULT '0',
+                    capital_deployed TEXT NOT NULL DEFAULT '0',
+                    PRIMARY KEY (date, mode)
+                );
+                INSERT OR IGNORE INTO daily_pnl_new (date, mode, trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed)
+                    SELECT date, 'paper', trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed FROM daily_pnl;
+                DROP TABLE daily_pnl;
+                ALTER TABLE daily_pnl_new RENAME TO daily_pnl;"
+            ).execute(&self.pool).await?;
+        }
+
         Ok(())
     }
 
@@ -145,6 +202,7 @@ fn opportunity_from_row(row: sqlx::sqlite::SqliteRow) -> OpportunityRow {
         detected_at: parse_dt(row.get::<&str, _>("detected_at")),
         executed_at: parse_opt_dt(row.get::<Option<String>, _>("executed_at")),
         resolved_at: parse_opt_dt(row.get::<Option<String>, _>("resolved_at")),
+        mode: row.get("mode"),
     }
 }
 
@@ -164,6 +222,7 @@ fn order_from_row(row: sqlx::sqlite::SqliteRow) -> OrderRow {
         filled_at: parse_opt_dt(row.get::<Option<String>, _>("filled_at")),
         cancelled_at: parse_opt_dt(row.get::<Option<String>, _>("cancelled_at")),
         cancel_reason: row.get("cancel_reason"),
+        mode: row.get("mode"),
     }
 }
 
@@ -183,6 +242,7 @@ fn position_from_row(row: sqlx::sqlite::SqliteRow) -> PositionRow {
         status: row.get("status"),
         opened_at: parse_dt(row.get::<&str, _>("opened_at")),
         settled_at: parse_opt_dt(row.get::<Option<String>, _>("settled_at")),
+        mode: row.get("mode"),
     }
 }
 
@@ -200,6 +260,7 @@ fn snapshot_from_row(row: sqlx::sqlite::SqliteRow) -> PriceSnapshotRow {
 fn daily_pnl_from_row(row: sqlx::sqlite::SqliteRow) -> DailyPnlRow {
     DailyPnlRow {
         date: row.get("date"),
+        mode: row.get("mode"),
         trades_executed: row.get::<i64, _>("trades_executed"),
         trades_filled: row.get::<i64, _>("trades_filled"),
         gross_profit: parse_decimal(row.get::<&str, _>("gross_profit")),
@@ -285,8 +346,8 @@ impl Repository for SqliteRepository {
 
     async fn insert_opportunity(&self, opp: &OpportunityRow) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO opportunities (id, pair_id, poly_side, poly_price, kalshi_side, kalshi_price, spread, spread_pct, max_quantity, status, detected_at, executed_at, resolved_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO opportunities (id, pair_id, poly_side, poly_price, kalshi_side, kalshi_price, spread, spread_pct, max_quantity, status, detected_at, executed_at, resolved_at, mode)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&opp.id)
         .bind(&opp.pair_id)
@@ -301,6 +362,7 @@ impl Repository for SqliteRepository {
         .bind(opp.detected_at.to_rfc3339())
         .bind(opp.executed_at.map(|t| t.to_rfc3339()))
         .bind(opp.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(&opp.mode)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -309,7 +371,7 @@ impl Repository for SqliteRepository {
     async fn get_opportunity(&self, id: &Uuid) -> anyhow::Result<Option<OpportunityRow>> {
         let id_str = id.to_string();
         let row = sqlx::query(
-            "SELECT id, pair_id, poly_side, poly_price, kalshi_side, kalshi_price, spread, spread_pct, max_quantity, status, detected_at, executed_at, resolved_at FROM opportunities WHERE id = ?"
+            "SELECT id, pair_id, poly_side, poly_price, kalshi_side, kalshi_price, spread, spread_pct, max_quantity, status, detected_at, executed_at, resolved_at, mode FROM opportunities WHERE id = ?"
         )
         .bind(&id_str)
         .fetch_optional(&self.pool)
@@ -319,7 +381,7 @@ impl Repository for SqliteRepository {
 
     async fn list_opportunities_by_status(&self, status: &str) -> anyhow::Result<Vec<OpportunityRow>> {
         let rows = sqlx::query(
-            "SELECT id, pair_id, poly_side, poly_price, kalshi_side, kalshi_price, spread, spread_pct, max_quantity, status, detected_at, executed_at, resolved_at FROM opportunities WHERE status = ?"
+            "SELECT id, pair_id, poly_side, poly_price, kalshi_side, kalshi_price, spread, spread_pct, max_quantity, status, detected_at, executed_at, resolved_at, mode FROM opportunities WHERE status = ?"
         )
         .bind(status)
         .fetch_all(&self.pool)
@@ -348,8 +410,8 @@ impl Repository for SqliteRepository {
 
     async fn insert_order(&self, order: &OrderRow) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO orders (id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO orders (id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason, mode)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&order.id)
         .bind(&order.opportunity_id)
@@ -365,6 +427,7 @@ impl Repository for SqliteRepository {
         .bind(order.filled_at.map(|t| t.to_rfc3339()))
         .bind(order.cancelled_at.map(|t| t.to_rfc3339()))
         .bind(&order.cancel_reason)
+        .bind(&order.mode)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -373,7 +436,7 @@ impl Repository for SqliteRepository {
     async fn get_order(&self, id: &Uuid) -> anyhow::Result<Option<OrderRow>> {
         let id_str = id.to_string();
         let row = sqlx::query(
-            "SELECT id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason FROM orders WHERE id = ?"
+            "SELECT id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason, mode FROM orders WHERE id = ?"
         )
         .bind(&id_str)
         .fetch_optional(&self.pool)
@@ -384,7 +447,7 @@ impl Repository for SqliteRepository {
     async fn list_orders_by_opportunity(&self, opportunity_id: &Uuid) -> anyhow::Result<Vec<OrderRow>> {
         let id_str = opportunity_id.to_string();
         let rows = sqlx::query(
-            "SELECT id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason FROM orders WHERE opportunity_id = ?"
+            "SELECT id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason, mode FROM orders WHERE opportunity_id = ?"
         )
         .bind(&id_str)
         .fetch_all(&self.pool)
@@ -394,7 +457,7 @@ impl Repository for SqliteRepository {
 
     async fn list_orders_by_status(&self, status: &str) -> anyhow::Result<Vec<OrderRow>> {
         let rows = sqlx::query(
-            "SELECT id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason FROM orders WHERE status = ?"
+            "SELECT id, opportunity_id, platform, platform_order_id, market_id, side, price, quantity, filled_quantity, status, placed_at, filled_at, cancelled_at, cancel_reason, mode FROM orders WHERE status = ?"
         )
         .bind(status)
         .fetch_all(&self.pool)
@@ -427,8 +490,8 @@ impl Repository for SqliteRepository {
 
     async fn insert_position(&self, position: &PositionRow) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO positions (id, pair_id, poly_side, poly_quantity, poly_avg_price, kalshi_side, kalshi_quantity, kalshi_avg_price, hedged_quantity, unhedged_quantity, guaranteed_profit, status, opened_at, settled_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO positions (id, pair_id, poly_side, poly_quantity, poly_avg_price, kalshi_side, kalshi_quantity, kalshi_avg_price, hedged_quantity, unhedged_quantity, guaranteed_profit, status, opened_at, settled_at, mode)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&position.id)
         .bind(&position.pair_id)
@@ -444,6 +507,7 @@ impl Repository for SqliteRepository {
         .bind(&position.status)
         .bind(position.opened_at.to_rfc3339())
         .bind(position.settled_at.map(|t| t.to_rfc3339()))
+        .bind(&position.mode)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -452,7 +516,7 @@ impl Repository for SqliteRepository {
     async fn get_position(&self, id: &Uuid) -> anyhow::Result<Option<PositionRow>> {
         let id_str = id.to_string();
         let row = sqlx::query(
-            "SELECT id, pair_id, poly_side, poly_quantity, poly_avg_price, kalshi_side, kalshi_quantity, kalshi_avg_price, hedged_quantity, unhedged_quantity, guaranteed_profit, status, opened_at, settled_at FROM positions WHERE id = ?"
+            "SELECT id, pair_id, poly_side, poly_quantity, poly_avg_price, kalshi_side, kalshi_quantity, kalshi_avg_price, hedged_quantity, unhedged_quantity, guaranteed_profit, status, opened_at, settled_at, mode FROM positions WHERE id = ?"
         )
         .bind(&id_str)
         .fetch_optional(&self.pool)
@@ -462,8 +526,19 @@ impl Repository for SqliteRepository {
 
     async fn list_open_positions(&self) -> anyhow::Result<Vec<PositionRow>> {
         let rows = sqlx::query(
-            "SELECT id, pair_id, poly_side, poly_quantity, poly_avg_price, kalshi_side, kalshi_quantity, kalshi_avg_price, hedged_quantity, unhedged_quantity, guaranteed_profit, status, opened_at, settled_at FROM positions WHERE status = 'open'"
+            "SELECT id, pair_id, poly_side, poly_quantity, poly_avg_price, kalshi_side, kalshi_quantity, kalshi_avg_price, hedged_quantity, unhedged_quantity, guaranteed_profit, status, opened_at, settled_at, mode FROM positions WHERE status = 'open'"
         )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(position_from_row).collect())
+    }
+
+    /// List open positions filtered by trading mode.
+    async fn list_positions_by_mode(&self, mode: &str) -> anyhow::Result<Vec<PositionRow>> {
+        let rows = sqlx::query(
+            "SELECT id, pair_id, poly_side, poly_quantity, poly_avg_price, kalshi_side, kalshi_quantity, kalshi_avg_price, hedged_quantity, unhedged_quantity, guaranteed_profit, status, opened_at, settled_at, mode FROM positions WHERE status = 'open' AND mode = ?"
+        )
+        .bind(mode)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(position_from_row).collect())
@@ -518,9 +593,9 @@ impl Repository for SqliteRepository {
 
     async fn upsert_daily_pnl(&self, pnl: &DailyPnlRow) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO daily_pnl (date, trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(date) DO UPDATE SET
+            "INSERT INTO daily_pnl (date, mode, trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(date, mode) DO UPDATE SET
                 trades_executed = excluded.trades_executed,
                 trades_filled = excluded.trades_filled,
                 gross_profit = excluded.gross_profit,
@@ -529,6 +604,7 @@ impl Repository for SqliteRepository {
                 capital_deployed = excluded.capital_deployed"
         )
         .bind(&pnl.date)
+        .bind(&pnl.mode)
         .bind(pnl.trades_executed)
         .bind(pnl.trades_filled)
         .bind(pnl.gross_profit.to_string())
@@ -543,7 +619,7 @@ impl Repository for SqliteRepository {
     async fn get_daily_pnl(&self, date: NaiveDate) -> anyhow::Result<Option<DailyPnlRow>> {
         let date_str = date.to_string();
         let row = sqlx::query(
-            "SELECT date, trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed FROM daily_pnl WHERE date = ?"
+            "SELECT date, mode, trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed FROM daily_pnl WHERE date = ?"
         )
         .bind(&date_str)
         .fetch_optional(&self.pool)
@@ -559,13 +635,33 @@ impl Repository for SqliteRepository {
         let from_str = from.to_string();
         let to_str = to.to_string();
         let rows = sqlx::query(
-            "SELECT date, trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed FROM daily_pnl WHERE date >= ? AND date <= ? ORDER BY date"
+            "SELECT date, mode, trades_executed, trades_filled, gross_profit, fees_paid, net_profit, capital_deployed FROM daily_pnl WHERE date >= ? AND date <= ? ORDER BY date"
         )
         .bind(&from_str)
         .bind(&to_str)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(daily_pnl_from_row).collect())
+    }
+
+    async fn insert_unwind_event(&self, event: &UnwindEventRow) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO unwind_events (id, position_id, platform, order_id, entry_price, exit_price, quantity, slippage, loss, unwound_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&event.id)
+        .bind(&event.position_id)
+        .bind(&event.platform)
+        .bind(&event.order_id)
+        .bind(event.entry_price.to_string())
+        .bind(event.exit_price.to_string())
+        .bind(event.quantity)
+        .bind(event.slippage.to_string())
+        .bind(event.loss.to_string())
+        .bind(event.unwound_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -613,6 +709,7 @@ mod tests {
             detected_at: Utc::now(),
             executed_at: None,
             resolved_at: None,
+            mode: "paper".to_string(),
         }
     }
 
@@ -632,6 +729,7 @@ mod tests {
             filled_at: None,
             cancelled_at: None,
             cancel_reason: None,
+            mode: "paper".to_string(),
         }
     }
 
@@ -651,6 +749,7 @@ mod tests {
             status: "open".to_string(),
             opened_at: Utc::now(),
             settled_at: None,
+            mode: "paper".to_string(),
         }
     }
 
@@ -886,6 +985,7 @@ mod tests {
         let repo = setup().await;
         let pnl = DailyPnlRow {
             date: "2026-04-06".to_string(),
+            mode: "paper".to_string(),
             trades_executed: 5,
             trades_filled: 3,
             gross_profit: dec!(10.50),
@@ -904,6 +1004,7 @@ mod tests {
         let repo = setup().await;
         let pnl1 = DailyPnlRow {
             date: "2026-04-06".to_string(),
+            mode: "paper".to_string(),
             trades_executed: 5,
             trades_filled: 3,
             gross_profit: dec!(10.00),
@@ -914,6 +1015,7 @@ mod tests {
         repo.upsert_daily_pnl(&pnl1).await.unwrap();
         let pnl2 = DailyPnlRow {
             date: "2026-04-06".to_string(),
+            mode: "paper".to_string(),
             trades_executed: 10,
             trades_filled: 8,
             gross_profit: dec!(25.00),
