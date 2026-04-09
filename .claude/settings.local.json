@@ -1,0 +1,49 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep \"ratatui\" Cargo.toml crates/*/Cargo.toml)",
+      "Bash(cargo clippy:*)"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/*.key)",
+      "Read(**/*.pem)",
+      "Read(**/*.secret)",
+      "Read(**/credentials*)",
+      "Read(**/secrets.yml)",
+      "Read(**/secrets.yaml)",
+      "Read(**/service_account.json)",
+      "Bash(cat */.env*)",
+      "Bash(cat *.env*)",
+      "Bash(cat *.key)",
+      "Bash(cat *.pem)",
+      "Bash(head */.env*)",
+      "Bash(tail */.env*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/block-secrets.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/block-secrets.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
