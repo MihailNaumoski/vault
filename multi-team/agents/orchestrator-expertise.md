@@ -97,6 +97,16 @@ Max lines: 10000
 - **Context**: Research found tachyonfx (shader-like effects for ratatui). Planning spec marked it optional (AC-10.5 feature flag). Trading team skipped it, focusing on core chart redesign. Correct call — 1903 lines was already a substantial rewrite.
 - **Action**: When a research phase discovers "nice to have" crate additions, don't burden the first implementation pass. Implement core functionality first, effects/polish in a follow-up phase.
 
+### Strategy-Only Tasks Can Skip Code Review — 2026-04-09
+- **Context**: Strategy improvement task (better market selection + unstarted-match filtering) produced only filter additions — conditional checks in detector.rs and main.rs, plus a config change.
+- **Insight**: When the Trading team adds filters/conditions (no new data flows, no security boundaries, no concurrency changes), a full Engineering Code Review is overkill. The Orchestrator can verify by reading the diff and running tests.
+- **Action**: For filter-addition tasks, verify tests pass and changes are consistent with the strategy doc. Skip Engineering Code Review unless changes touch execution flow, authentication, or concurrency.
+
+### Trading Team: Quant → Engine Sequential Works Well — 2026-04-09
+- **Context**: Quant Strategist designed strategy + wrote docs/strategy-improvement.md + implemented detector.rs changes within their domain. Then Rust Engine Dev implemented main.rs discovery pipeline changes using the strategy doc as spec.
+- **Insight**: The sequential Quant → Engine flow worked cleanly. The strategy doc served as the interface — Rust Engine Dev didn't need to re-derive the requirements.
+- **Action**: For strategy changes, always run Quant Strategist first to produce the strategy doc. Pass the doc path to Rust Engine Dev.
+
 ### Mock Connector One-Shot Failure Semantics — 2026-04-06
 - **Context**: Both mock connectors (Polymarket/Kalshi) use a one-shot `should_fail` field that is consumed by the FIRST call to any method (including `get_balance()`). The build prompt assumed failures would hit `place_limit_order()`, but the executor calls `get_balance()` first during risk checks, consuming the failure before the order placement.
 - **Insight**: Test code that injects failures must account for the call ordering in the system under test. A wrapper struct that fails only on specific methods is more reliable than one-shot injection.

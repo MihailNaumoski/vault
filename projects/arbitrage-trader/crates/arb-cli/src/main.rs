@@ -516,7 +516,7 @@ async fn main() -> Result<()> {
         // Fetch real Polymarket markets via Gamma API
         let gamma_url = &app_config.polymarket.gamma_url;
         let http = reqwest::Client::new();
-        let resp = http.get(format!("{gamma_url}/markets?active=true&closed=false&limit=100&order=volume24hr&ascending=false"))
+        let resp = http.get(format!("{gamma_url}/markets?active=true&closed=false&limit=200&order=volume24hr&ascending=false"))
             .send().await;
 
         // Fetch real Kalshi markets
@@ -558,13 +558,28 @@ async fn main() -> Result<()> {
                     let poly_yes: rust_decimal::Decimal = prices[0].parse().unwrap_or_default();
                     let poly_no: rust_decimal::Decimal = prices[1].parse().unwrap_or_default();
 
-                    if poly_yes < dec!(0.05) || poly_yes > dec!(0.95) { continue; }
+                    // Tighter price filter: reject near-decided markets (0.10-0.90)
+                    if poly_yes < dec!(0.10) || poly_yes > dec!(0.90) { continue; }
                     if condition_id.is_empty() { continue; }
+
+                    // Minimum volume filter: skip illiquid markets
+                    if market_volume < dec!(10000) {
+                        continue;
+                    }
 
                     let close_time = chrono::NaiveDate::parse_from_str(end_date, "%Y-%m-%d")
                         .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
                         .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
                         .unwrap_or_else(|_| Utc::now() + chrono::Duration::days(30));
+
+                    // Close-time filter: skip events closing within 6 hours.
+                    // Targets the liquidity cliff (final ~4-6h) while keeping
+                    // the vast majority of valid markets. Decided markets are
+                    // caught separately by the price extreme filter.
+                    let hours_to_close = (close_time - Utc::now()).num_hours();
+                    if hours_to_close < 6 {
+                        continue;
+                    }
 
                     poly_raw_by_cid.insert(condition_id.to_string(), m);
                     poly_markets_for_match.push(Market {
@@ -587,11 +602,18 @@ async fn main() -> Result<()> {
                     let candidates = pipeline.find_matches(&poly_markets_for_match, &kalshi_markets);
                     info!(candidates = candidates.len(), "Match pipeline produced candidates");
 
-                    let mut count = 0usize;
+                    // Quality-gated pair selection: take all pairs with composite
+                    // score >= 0.75 instead of arbitrary cap of 12. Let quality
+                    // determine the active pair set.
+                    const MIN_QUALITY_SCORE: f64 = 0.82;
+                    const MAX_PAIRS: usize = 20;
+                    let mut seeded_count: usize = 0;
                     for c in &candidates {
-                        if count >= 12 { break; }
+                        if seeded_count >= MAX_PAIRS { break; }
                         let decision = c.score.decision();
                         if decision == arb_matcher::MatchDecision::Rejected { continue; }
+                        if c.score.text_similarity < 0.80 { continue; }
+                        if c.score.composite < MIN_QUALITY_SCORE { continue; }
 
                         let condition_id = &c.poly_market.platform_id;
                         let kalshi_ticker = &c.kalshi_market.platform_id;
@@ -646,7 +668,7 @@ async fn main() -> Result<()> {
                             poly_no_token_id: no_token_id,
                             volume: c.poly_market.volume,
                         });
-                        count += 1;
+                        seeded_count += 1;
                     }
                 } else {
                     warn!("No Kalshi markets available for matching — cannot seed pairs automatically");

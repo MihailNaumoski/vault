@@ -55,6 +55,33 @@ impl Detector {
             return None;
         }
 
+        // Close-time filter: skip pairs closing within 6 hours.
+        // The final ~4-6 hours before market close see a liquidity cliff as market
+        // makers pull orders. 6h gives enough runway for both arb legs to fill
+        // while keeping the vast majority of valid markets eligible.
+        // Note: "decided" markets are already caught by the price extreme filter
+        // below — this gate targets liquidity decline, not outcome certainty.
+        let hours_to_close = (pair.close_time - Utc::now()).num_hours();
+        if hours_to_close < 6 {
+            return None;
+        }
+
+        // Price extreme filter: reject near-decided markets.
+        // Any individual price below 0.05 or above 0.95 indicates the market is
+        // effectively decided — remaining spread is phantom and counterparties
+        // won't fill at reasonable sizes.
+        if prices.poly_yes < dec!(0.05)
+            || prices.poly_yes > dec!(0.95)
+            || prices.poly_no < dec!(0.05)
+            || prices.poly_no > dec!(0.95)
+            || prices.kalshi_yes < dec!(0.05)
+            || prices.kalshi_yes > dec!(0.95)
+            || prices.kalshi_no < dec!(0.05)
+            || prices.kalshi_no > dec!(0.95)
+        {
+            return None;
+        }
+
         let spread_a = dec!(1) - prices.poly_yes - prices.kalshi_no;
         let spread_b = dec!(1) - prices.poly_no - prices.kalshi_yes;
 
@@ -266,5 +293,71 @@ mod tests {
         };
         let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &fees);
         assert!(d.scan(&[pair_info(pid)]).is_empty());
+    }
+
+    #[test]
+    fn test_rejects_near_expiry_pair() {
+        // Pair closing in 3 hours (< 6h threshold) should be rejected
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.42), dec!(0.58), dec!(0.47), dec!(0.53));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
+        let mut pi = pair_info(pid);
+        pi.close_time = Utc::now() + CDur::hours(3); // Only 3h out — below 6h minimum
+        assert!(d.scan(&[pi]).is_empty());
+    }
+
+    #[test]
+    fn test_accepts_far_expiry_pair() {
+        // Pair closing in 7 days (> 6h threshold) should be accepted if spread is good
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.42), dec!(0.58), dec!(0.47), dec!(0.53));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
+        let mut pi = pair_info(pid);
+        pi.close_time = Utc::now() + CDur::days(7);
+        let opps = d.scan(&[pi]);
+        assert_eq!(opps.len(), 1);
+    }
+
+    #[test]
+    fn test_rejects_extreme_poly_yes_high() {
+        // poly_yes = 0.96 (> 0.95) — market is essentially decided YES
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.96), dec!(0.04), dec!(0.90), dec!(0.10));
+        let d = Detector::new(cache, &cfg(dec!(1.0), dec!(0.01)), &zero_fees());
+        assert!(d.scan(&[pair_info(pid)]).is_empty());
+    }
+
+    #[test]
+    fn test_rejects_extreme_kalshi_no_high() {
+        // kalshi_no = 0.96 (> 0.95) — near-decided on Kalshi side
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.50), dec!(0.50), dec!(0.04), dec!(0.96));
+        let d = Detector::new(cache, &cfg(dec!(1.0), dec!(0.01)), &zero_fees());
+        assert!(d.scan(&[pair_info(pid)]).is_empty());
+    }
+
+    #[test]
+    fn test_rejects_extreme_poly_yes_low() {
+        // poly_yes = 0.04 (< 0.05) — market is essentially decided NO
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.04), dec!(0.96), dec!(0.10), dec!(0.90));
+        let d = Detector::new(cache, &cfg(dec!(1.0), dec!(0.01)), &zero_fees());
+        assert!(d.scan(&[pair_info(pid)]).is_empty());
+    }
+
+    #[test]
+    fn test_accepts_moderate_prices() {
+        // All prices in the safe range [0.10, 0.90] — should pass price filter
+        let pid = Uuid::now_v7();
+        let cache = Arc::new(PriceCache::new());
+        fill_cache(&cache, pid, dec!(0.42), dec!(0.58), dec!(0.47), dec!(0.53));
+        let d = Detector::new(cache, &cfg(dec!(3.0), dec!(0.02)), &zero_fees());
+        let opps = d.scan(&[pair_info(pid)]);
+        assert_eq!(opps.len(), 1);
     }
 }

@@ -70,6 +70,7 @@ impl KalshiClient {
         if let Some(s) = status {
             req = req.query(&[("status", s)]);
         }
+        req = req.query(&[("limit", "200")]);
 
         let headers = self.auth.headers("GET", &format!("/trade-api/v2{}", path))?;
         req = req.headers(headers);

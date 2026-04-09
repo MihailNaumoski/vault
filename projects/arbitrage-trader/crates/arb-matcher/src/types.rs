@@ -27,7 +27,7 @@ pub enum MatchDecision {
 
 impl MatchScore {
     pub fn decision(&self) -> MatchDecision {
-        if self.composite >= 0.85 {
+        if self.composite >= 0.90 {
             MatchDecision::AutoVerified
         } else if self.composite >= 0.50 {
             MatchDecision::NeedsReview
