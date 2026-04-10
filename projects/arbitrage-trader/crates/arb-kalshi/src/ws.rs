@@ -147,9 +147,9 @@ mod ws_inner {
     #[derive(Deserialize)]
     pub struct OrderbookSnapshotMsg {
         pub market_ticker: String,
-        #[serde(default)]
+        #[serde(default, rename = "yes_dollars_fp", alias = "yes")]
         pub yes: Vec<Vec<serde_json::Value>>,
-        #[serde(default)]
+        #[serde(default, rename = "no_dollars_fp", alias = "no")]
         pub no: Vec<Vec<serde_json::Value>>,
     }
 
@@ -604,7 +604,15 @@ async fn connect_and_run(
         .await
         .map_err(|e| KalshiError::WebSocket(format!("subscribe send failed: {e}")))?;
 
-    let ticker_sub = build_subscribe_message(2, &["ticker"], tickers);
+    let ticker_sub = serde_json::json!({
+        "id": 2,
+        "cmd": "subscribe",
+        "params": {
+            "channels": ["ticker"],
+            "market_tickers": tickers,
+            "send_initial_snapshot": true
+        }
+    });
     write
         .send(Message::Text(ticker_sub.to_string().into()))
         .await

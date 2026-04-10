@@ -16,7 +16,7 @@ pub mod mock;
 
 pub use connector::KalshiConnector;
 pub use error::KalshiError;
-pub use types::KalshiConfig;
+pub use types::{KalshiConfig, KalshiEventResponse};
 
 #[cfg(feature = "mock")]
 pub use mock::MockKalshiConnector;

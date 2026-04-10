@@ -4,16 +4,4 @@
 # must include full platform identifiers so the engine can subscribe to
 # price feeds immediately.
 #
-# These pairs use REAL market IDs fetched from the Polymarket Gamma API
-# and the Kalshi Trade API on 2026-04-08.
-
-# --- Strait of Hormuz traffic returns to normal ---
-# Polymarket: "Strait of Hormuz traffic returns to normal by end of April?"
-# Kalshi:     KXHORMUZNORM-26MAR17-B260501 (Hormuz transit calls above 60 before May 1)
-[[pairs]]
-poly_condition_id = "0x924a2942747dd75703321a7c8d809c68f6a514c3b0f2a2e64274e02310634669"
-poly_yes_token_id = "77893140510362582253172593084218413010407941075415081594586195705930819989216"
-poly_no_token_id  = "56231474151770057648855426299021396541474371449092934400587810748856711049761"
-poly_question     = "Strait of Hormuz traffic returns to normal by end of April?"
-kalshi_ticker     = "KXHORMUZNORM-26MAR17-B260501"
-kalshi_question   = "Will Strait of Hormuz transit calls be above 60 before May 1, 2026?"
+# Leave empty to rely entirely on auto-discovery.

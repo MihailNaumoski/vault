@@ -99,6 +99,10 @@ impl SqliteRepository {
         // Migration 003: add mode column (idempotent — checks if column exists first)
         self.run_migration_003().await?;
 
+        // Migration 004: discovery tables (idempotent — CREATE IF NOT EXISTS)
+        let discovery = include_str!("../../../migrations/004_discovery_tables.sql");
+        sqlx::raw_sql(discovery).execute(&self.pool).await?;
+
         tracing::info!("Database migrations applied");
         Ok(())
     }

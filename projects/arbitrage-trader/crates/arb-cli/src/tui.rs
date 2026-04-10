@@ -59,8 +59,9 @@ pub struct PriceRow {
     pub prev_poly_yes: Decimal,
     pub spread: Decimal,
     pub last_update_secs: i64,
-    #[allow(dead_code)]
     pub volume: Decimal,
+    pub close_time: chrono::DateTime<chrono::Utc>,
+    pub verified: bool,
 }
 
 const CHART_MAX_TICKS: usize = 120;
@@ -185,6 +186,7 @@ pub struct TuiState {
     pub tab_view: TabView,
     pub risk_limits: RiskLimits,
     pub tick_count: HashMap<Uuid, usize>,
+    pub total_discovered_pairs: usize,
 }
 
 impl TuiState {
@@ -216,6 +218,7 @@ impl TuiState {
             tab_view: TabView::Orders,
             risk_limits: RiskLimits::default(),
             tick_count: HashMap::new(),
+            total_discovered_pairs: 0,
         }
     }
 }
@@ -338,6 +341,8 @@ pub async fn refresh_state(
                     spread,
                     last_update_secs: age,
                     volume: pair.volume,
+                    close_time: pair.close_time,
+                    verified: pair.verified,
                 }
             })
             .collect();
@@ -615,7 +620,11 @@ fn draw_status(frame: &mut Frame, state: &TuiState, area: Rect) {
         Span::styled(&uptime_str, Style::default().fg(POLY_COLOR)),
         Span::styled(" \u{2502} ", Style::default().fg(DIM)),
         Span::styled(
-            format!("{} pairs", state.pair_count),
+            if state.total_discovered_pairs > 0 {
+                format!("{}/{} pairs", state.pair_count, state.total_discovered_pairs)
+            } else {
+                format!("{} pairs", state.pair_count)
+            },
             Style::default().fg(POLY_COLOR),
         ),
         Span::styled(" \u{2502} ", Style::default().fg(DIM)),
@@ -1336,19 +1345,56 @@ fn draw_risk_gauges(frame: &mut Frame, state: &TuiState, area: Rect) {
 //  Drawing — Live prices table
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn format_close_compact(close_time: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let dur = close_time.signed_duration_since(now);
+    let secs = dur.num_seconds();
+    if secs < 0 {
+        "past".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 86400 * 90 {
+        format!("{}d", secs / 86400)
+    } else {
+        format!("{}mo", secs / (86400 * 30))
+    }
+}
+
+fn close_time_color(close_time: chrono::DateTime<chrono::Utc>) -> Color {
+    let now = chrono::Utc::now();
+    let dur = close_time.signed_duration_since(now);
+    let hours = dur.num_hours();
+    if hours < 12 {
+        LOSS_RED
+    } else if hours < 24 {
+        AMBER
+    } else {
+        DIM
+    }
+}
+
 fn draw_prices(frame: &mut Frame, state: &TuiState, area: Rect) {
-    let header = Row::new(vec![
+    let w = area.width;
+
+    // Responsive tiers: >= 100 full, >= 80 yes-only, < 80 hide trend too
+    let show_no_prices = w >= 100;
+    let show_trend = w >= 80;
+
+    // Build header
+    let mut header_cells = vec![
         Cell::from("Market").style(Style::default().bold()),
-        Cell::from("P.Yes").style(Style::default().bold()),
-        Cell::from("P.No").style(Style::default().bold()),
-        Cell::from("Chg").style(Style::default().bold()),
-        Cell::from("K.Yes").style(Style::default().bold()),
-        Cell::from("K.No").style(Style::default().bold()),
+        Cell::from("Poly").style(Style::default().bold()),
+        Cell::from("Kalshi").style(Style::default().bold()),
         Cell::from("Spread").style(Style::default().bold()),
-        Cell::from("Trend").style(Style::default().bold()),
-        Cell::from("Age").style(Style::default().bold()),
-    ])
-    .style(Style::default().bg(HEADER_BG));
+    ];
+    if show_trend {
+        header_cells.push(Cell::from("Trend").style(Style::default().bold()));
+    }
+    header_cells.push(Cell::from("Timing").style(Style::default().bold()));
+
+    let header = Row::new(header_cells).style(Style::default().bg(HEADER_BG));
 
     let rows: Vec<Row> = state
         .prices
@@ -1357,34 +1403,71 @@ fn draw_prices(frame: &mut Frame, state: &TuiState, area: Rect) {
         .map(|(i, p)| {
             let row_bg = if i % 2 == 1 { ROW_ALT_BG } else { Color::Reset };
 
+            // ── Market column with verified icon ──
+            let verified_icon = if p.verified {
+                Span::styled("\u{2713} ", Style::default().fg(PROFIT_GREEN))
+            } else {
+                Span::styled("? ", Style::default().fg(AMBER))
+            };
+            let market_cell = Cell::from(Line::from(vec![
+                verified_icon,
+                Span::raw(&p.name),
+            ]));
+
+            // ── Change-based color for Poly Yes price ──
             let change = if p.prev_poly_yes > Decimal::ZERO {
-                ((p.poly_yes - p.prev_poly_yes) / p.prev_poly_yes) * dec!(100)
+                p.poly_yes - p.prev_poly_yes
             } else {
                 Decimal::ZERO
             };
-            let change_str = if change == dec!(0) {
-                " --".to_string()
-            } else {
-                format!("{:+.1}%", change)
-            };
-            let change_color = if change > dec!(0) {
-                PROFIT_GREEN
-            } else if change < dec!(0) {
+            let poly_yes_color = if change > Decimal::ZERO {
+                Color::Rgb(34, 211, 238) // bright cyan-400
+            } else if change < Decimal::ZERO {
                 LOSS_RED
             } else {
-                DIM
+                POLY_COLOR
             };
 
-            let spread_str = format!("{:.1}c", p.spread * dec!(100));
-
-            let age_str = if p.last_update_secs < 0 {
-                "now".into()
-            } else if p.last_update_secs < 60 {
-                format!("{}s ago", p.last_update_secs)
+            // ── Stacked Poly column: "0.52  0.48" ──
+            let poly_cell = if show_no_prices {
+                Cell::from(Line::from(vec![
+                    Span::styled(format!("{:.2}", p.poly_yes), Style::default().fg(poly_yes_color).bold()),
+                    Span::raw("  "),
+                    Span::styled(format!("{:.2}", p.poly_no), Style::default().fg(POLY_COLOR).dim()),
+                ]))
             } else {
-                format!("{}m ago", p.last_update_secs / 60)
+                Cell::from(Line::from(vec![
+                    Span::styled(format!("{:.2}", p.poly_yes), Style::default().fg(poly_yes_color).bold()),
+                ]))
             };
 
+            // ── Stacked Kalshi column: "0.47  0.53" ──
+            let kalshi_cell = if show_no_prices {
+                Cell::from(Line::from(vec![
+                    Span::styled(format!("{:.2}", p.kalshi_yes), Style::default().fg(KALSHI_COLOR).bold()),
+                    Span::raw("  "),
+                    Span::styled(format!("{:.2}", p.kalshi_no), Style::default().fg(KALSHI_COLOR).dim()),
+                ]))
+            } else {
+                Cell::from(Line::from(vec![
+                    Span::styled(format!("{:.2}", p.kalshi_yes), Style::default().fg(KALSHI_COLOR).bold()),
+                ]))
+            };
+
+            // ── Spread column with volume indicator ──
+            let spread_str = format!("{:.1}c", p.spread * dec!(100));
+            let vol_f = p.volume.to_f64().unwrap_or(0.0);
+            let vol_span = if vol_f >= 50_000.0 {
+                Span::styled(" $", Style::default().fg(PROFIT_GREEN).bold())
+            } else {
+                Span::styled(" .", Style::default().fg(DIM))
+            };
+            let spread_cell = Cell::from(Line::from(vec![
+                Span::styled(spread_str, Style::default().fg(spread_color(p.spread))),
+                vol_span,
+            ]));
+
+            // ── Trend column (sparkline) ──
             let trend_str = state
                 .pair_charts
                 .get(&p.pair_id)
@@ -1396,32 +1479,33 @@ fn draw_prices(frame: &mut Frame, state: &TuiState, area: Rect) {
                 .map(|c| trend_color(&c.poly_yes))
                 .unwrap_or(DIM);
 
-            let age_cell = Cell::from(Line::from(vec![
+            // ── Timing column: "● {age}|{close}" ──
+            let age_str = format_age(p.last_update_secs);
+            let close_str = format_close_compact(p.close_time);
+            let timing_cell = Cell::from(Line::from(vec![
                 Span::styled(
-                    "\u{25cf}",
+                    "\u{25cf} ",
                     Style::default().fg(freshness_color(p.last_update_secs)),
                 ),
                 Span::styled(
-                    format!(" {}", age_str),
+                    age_str,
                     Style::default().fg(freshness_color(p.last_update_secs)),
+                ),
+                Span::styled("|", Style::default().fg(DIM)),
+                Span::styled(
+                    close_str,
+                    Style::default().fg(close_time_color(p.close_time)),
                 ),
             ]));
 
-            Row::new(vec![
-                Cell::from(p.name.clone()),
-                Cell::from(format!("{:.2}", p.poly_yes))
-                    .style(Style::default().fg(POLY_COLOR).bold()),
-                Cell::from(format!("{:.2}", p.poly_no)).style(Style::default().fg(POLY_COLOR)),
-                Cell::from(change_str).style(Style::default().fg(change_color)),
-                Cell::from(format!("{:.2}", p.kalshi_yes))
-                    .style(Style::default().fg(KALSHI_COLOR).bold()),
-                Cell::from(format!("{:.2}", p.kalshi_no))
-                    .style(Style::default().fg(KALSHI_COLOR)),
-                Cell::from(spread_str).style(Style::default().fg(spread_color(p.spread))),
-                Cell::from(trend_str).style(Style::default().fg(t_color)),
-                age_cell,
-            ])
-            .style(Style::default().bg(row_bg))
+            // ── Build row cells ──
+            let mut cells = vec![market_cell, poly_cell, kalshi_cell, spread_cell];
+            if show_trend {
+                cells.push(Cell::from(trend_str).style(Style::default().fg(t_color)));
+            }
+            cells.push(timing_cell);
+
+            Row::new(cells).style(Style::default().bg(row_bg))
         })
         .collect();
 
@@ -1433,22 +1517,21 @@ fn draw_prices(frame: &mut Frame, state: &TuiState, area: Rect) {
             Style::default().fg(AMBER).bold(),
         ));
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(18),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(8),
-            Constraint::Length(9),
-        ],
-    )
-    .header(header)
-    .block(block);
+    // Build constraints matching columns
+    let mut constraints = vec![
+        Constraint::Min(18),     // Market
+        Constraint::Length(11),  // Poly (stacked)
+        Constraint::Length(11),  // Kalshi (stacked)
+        Constraint::Length(8),   // Spread + vol
+    ];
+    if show_trend {
+        constraints.push(Constraint::Length(8));  // Trend
+    }
+    constraints.push(Constraint::Length(11)); // Timing
+
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .block(block);
 
     frame.render_widget(table, area);
 }
@@ -1817,6 +1900,7 @@ pub async fn run_tui(
     risk_manager: Arc<RwLock<RiskManager>>,
     mode: &str,
     pair_count: usize,
+    total_discovered: usize,
     price_cache: Arc<PriceCache>,
     pairs: Vec<PairInfo>,
 ) -> anyhow::Result<()> {
@@ -1827,6 +1911,7 @@ pub async fn run_tui(
 
     let mut state = TuiState::new(mode);
     state.pair_count = pair_count;
+    state.total_discovered_pairs = total_discovered;
     state.price_cache = Some(price_cache);
     state.pairs = pairs;
 

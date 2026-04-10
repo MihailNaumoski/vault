@@ -5,8 +5,9 @@ use crate::auth::KalshiAuth;
 use crate::error::KalshiError;
 use crate::rate_limit::KalshiRateLimiter;
 use crate::types::{
-    KalshiBalanceResponse, KalshiBookResponse, KalshiConfig, KalshiMarketResponse,
-    KalshiMarketsListResponse, KalshiOrderRequest, KalshiOrderResponse, KalshiOrdersListResponse,
+    KalshiBalanceResponse, KalshiBookResponse, KalshiConfig, KalshiEventResponse,
+    KalshiEventsListResponse, KalshiMarketResponse, KalshiMarketsListResponse,
+    KalshiOrderRequest, KalshiOrderResponse, KalshiOrdersListResponse,
     KalshiPositionResponse, KalshiPositionsListResponse,
 };
 
@@ -53,11 +54,14 @@ impl KalshiClient {
     // -----------------------------------------------------------------------
 
     /// List markets, optionally filtered by cursor and status.
+    ///
+    /// Returns the full response including the pagination cursor.
+    /// Use [`fetch_all_markets`] for automatic pagination.
     pub async fn fetch_markets(
         &self,
         cursor: Option<&str>,
         status: Option<&str>,
-    ) -> Result<Vec<KalshiMarketResponse>, KalshiError> {
+    ) -> Result<KalshiMarketsListResponse, KalshiError> {
         let path = "/markets";
         self.rate_limiter.acquire_read().await;
 
@@ -70,28 +74,47 @@ impl KalshiClient {
         if let Some(s) = status {
             req = req.query(&[("status", s)]);
         }
-        req = req.query(&[("limit", "200")]);
+        req = req.query(&[("limit", "1000")]);
 
         let headers = self.auth.headers("GET", &format!("/trade-api/v2{}", path))?;
         req = req.headers(headers);
 
-        let resp = req.send().await.map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let resp = self.send_with_retry(req).await?;
 
         let list: KalshiMarketsListResponse = resp.json().await.map_err(KalshiError::Http)?;
-        Ok(list.markets)
+        Ok(list)
+    }
+
+    /// Fetch all markets with automatic cursor pagination.
+    ///
+    /// Pages through up to `max_pages` of results (default 3, i.e. up to 3000
+    /// markets at limit=1000 per page). Stops early if no cursor is returned
+    /// (meaning we have all results).
+    pub async fn fetch_all_markets(
+        &self,
+        status: Option<&str>,
+        max_pages: usize,
+    ) -> Result<Vec<KalshiMarketResponse>, KalshiError> {
+        let max_pages = if max_pages == 0 { 3 } else { max_pages };
+        let mut all_markets = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for page in 0..max_pages {
+            let response = self
+                .fetch_markets(cursor.as_deref(), status)
+                .await?;
+            let count = response.markets.len();
+            all_markets.extend(response.markets);
+
+            debug!(page = page + 1, fetched = count, total = all_markets.len(), "Kalshi pagination");
+
+            match response.cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break, // No more pages
+            }
+        }
+
+        Ok(all_markets)
     }
 
     /// Fetch a single market by ticker.
@@ -103,26 +126,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("GET", &api_path)?;
 
-        let resp = self
-            .http
-            .get(&full_url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let req = self.http.get(&full_url).headers(headers);
+        let resp = self.send_with_retry(req).await?;
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
@@ -141,26 +146,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("GET", &api_path)?;
 
-        let resp = self
-            .http
-            .get(&full_url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let req = self.http.get(&full_url).headers(headers);
+        let resp = self.send_with_retry(req).await?;
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
@@ -168,6 +155,79 @@ impl KalshiClient {
         }
         let wrapper: Wrapper = resp.json().await.map_err(KalshiError::Http)?;
         Ok(wrapper.orderbook)
+    }
+
+    // -----------------------------------------------------------------------
+    // Events endpoints (100 req/s rate limit — market data)
+    // -----------------------------------------------------------------------
+
+    /// List events, optionally filtered by cursor and status.
+    ///
+    /// When `with_nested_markets` is true, each event includes its sub-markets.
+    /// Returns the full response including the pagination cursor.
+    pub async fn fetch_events(
+        &self,
+        cursor: Option<&str>,
+        status: Option<&str>,
+        with_nested_markets: bool,
+    ) -> Result<KalshiEventsListResponse, KalshiError> {
+        let path = "/events";
+        self.rate_limiter.acquire_read().await;
+
+        let full_path = format!("{}{}", self.base_url, path);
+        let mut req = self.http.get(&full_path);
+
+        if let Some(c) = cursor {
+            req = req.query(&[("cursor", c)]);
+        }
+        if let Some(s) = status {
+            req = req.query(&[("status", s)]);
+        }
+        req = req.query(&[("limit", "200")]);
+        if with_nested_markets {
+            req = req.query(&[("with_nested_markets", "true")]);
+        }
+
+        let headers = self.auth.headers("GET", &format!("/trade-api/v2{}", path))?;
+        req = req.headers(headers);
+
+        let resp = self.send_with_retry(req).await?;
+
+        let list: KalshiEventsListResponse = resp.json().await.map_err(KalshiError::Http)?;
+        Ok(list)
+    }
+
+    /// Fetch all events with automatic cursor pagination.
+    ///
+    /// Pages through up to `max_pages` of results (default 5, i.e. up to 1000
+    /// events at limit=200 per page). Stops early if no cursor is returned.
+    /// When `with_nested_markets` is true, each event includes its sub-markets.
+    pub async fn fetch_all_events(
+        &self,
+        status: Option<&str>,
+        max_pages: usize,
+        with_nested_markets: bool,
+    ) -> Result<Vec<KalshiEventResponse>, KalshiError> {
+        let max_pages = if max_pages == 0 { 5 } else { max_pages };
+        let mut all_events = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for page in 0..max_pages {
+            let response = self
+                .fetch_events(cursor.as_deref(), status, with_nested_markets)
+                .await?;
+            let count = response.events.len();
+            all_events.extend(response.events);
+
+            debug!(page = page + 1, fetched = count, total = all_events.len(), "Kalshi events pagination");
+
+            match response.cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break, // No more pages
+            }
+        }
+
+        Ok(all_events)
     }
 
     // -----------------------------------------------------------------------
@@ -186,27 +246,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("POST", &api_path)?;
 
-        let resp = self
-            .http
-            .post(&full_url)
-            .headers(headers)
-            .json(req)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let request = self.http.post(&full_url).headers(headers).json(req);
+        let resp = self.send_with_retry(request).await?;
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
@@ -225,26 +266,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("DELETE", &api_path)?;
 
-        let resp = self
-            .http
-            .delete(&full_url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let req = self.http.delete(&full_url).headers(headers);
+        self.send_with_retry(req).await?;
 
         Ok(())
     }
@@ -258,26 +281,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("GET", &api_path)?;
 
-        let resp = self
-            .http
-            .get(&full_url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let req = self.http.get(&full_url).headers(headers);
+        let resp = self.send_with_retry(req).await?;
 
         let list: KalshiOrdersListResponse = resp.json().await.map_err(KalshiError::Http)?;
         Ok(list.orders)
@@ -292,26 +297,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("GET", &api_path)?;
 
-        let resp = self
-            .http
-            .get(&full_url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let req = self.http.get(&full_url).headers(headers);
+        let resp = self.send_with_retry(req).await?;
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
@@ -334,26 +321,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("GET", &api_path)?;
 
-        let resp = self
-            .http
-            .get(&full_url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let req = self.http.get(&full_url).headers(headers);
+        let resp = self.send_with_retry(req).await?;
 
         let list: KalshiPositionsListResponse = resp.json().await.map_err(KalshiError::Http)?;
         Ok(list.market_positions)
@@ -368,26 +337,8 @@ impl KalshiClient {
         let api_path = format!("/trade-api/v2{}", path);
         let headers = self.auth.headers("GET", &api_path)?;
 
-        let resp = self
-            .http
-            .get(&full_url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(KalshiError::Http)?;
-        self.log_rate_limit_headers(&resp);
-
-        if resp.status() == 429 {
-            return Err(KalshiError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(KalshiError::Api {
-                status,
-                message: body,
-            });
-        }
+        let req = self.http.get(&full_url).headers(headers);
+        let resp = self.send_with_retry(req).await?;
 
         let balance: KalshiBalanceResponse = resp.json().await.map_err(KalshiError::Http)?;
         Ok(balance)
@@ -396,6 +347,72 @@ impl KalshiClient {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    /// Send a request with automatic 429 retry logic.
+    ///
+    /// If the server returns HTTP 429, reads the `Retry-After` header
+    /// (defaulting to 1 second) and retries up to 3 times.
+    async fn send_with_retry(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, KalshiError> {
+        // We need to clone the request for retries. RequestBuilder doesn't
+        // support Clone, so we build it once. For the retry path we
+        // reconstruct from the try_clone on the built Request.
+        let built = request.build().map_err(KalshiError::Http)?;
+
+        let mut attempts = 0u32;
+        let max_retries = 3u32;
+        let mut current_request = built;
+
+        loop {
+            // Clone for potential retry (try_clone returns None for streaming bodies)
+            let retry_req = current_request.try_clone();
+
+            let resp = self
+                .http
+                .execute(current_request)
+                .await
+                .map_err(KalshiError::Http)?;
+            self.log_rate_limit_headers(&resp);
+
+            if resp.status() == 429 {
+                attempts += 1;
+                if attempts > max_retries {
+                    return Err(KalshiError::RateLimited);
+                }
+
+                // Read Retry-After header (seconds), default to 1s
+                let wait_secs: u64 = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+
+                debug!(
+                    attempt = attempts,
+                    wait_secs,
+                    "Kalshi 429 rate limited, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+
+                current_request = retry_req.ok_or(KalshiError::RateLimited)?;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(KalshiError::Api {
+                    status,
+                    message: body,
+                });
+            }
+
+            return Ok(resp);
+        }
+    }
 
     /// Log rate limit headers from a response for monitoring.
     fn log_rate_limit_headers(&self, resp: &reqwest::Response) {

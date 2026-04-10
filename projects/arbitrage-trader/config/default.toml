@@ -36,6 +36,16 @@ ws_url = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 demo_base_url = "https://demo-api.kalshi.co/trade-api/v2"
 demo_ws_url = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
+[matcher]
+quality_gate = 0.65
+text_similarity_floor = 0.55
+auto_verified_threshold = 0.80
+needs_review_floor = 0.55
+max_discovered_pairs = 20
+# Safety: disable auto-verify until the matcher is calibrated on real data.
+# When false, all AutoVerified decisions are treated as NeedsReview.
+auto_verify_enabled = false
+
 [database]
 path = "data/arb.db"
 

@@ -6,7 +6,10 @@ use rust_decimal_macros::dec;
 
 use crate::client::KalshiClient;
 use crate::error::KalshiError;
-use crate::types::{KalshiBookResponse, KalshiConfig, KalshiMarketResponse, KalshiOrderRequest};
+use crate::types::{
+    KalshiBookResponse, KalshiConfig, KalshiEventResponse, KalshiMarketResponse,
+    KalshiOrderRequest,
+};
 use crate::ws::KalshiWebSocket;
 
 /// Full `PredictionMarketConnector` implementation for Kalshi.
@@ -27,6 +30,66 @@ impl KalshiConnector {
         let ws = KalshiWebSocket::new(ws_url, client.auth().clone());
         Ok(Self { client, ws })
     }
+
+    /// Fetch events from the Kalshi Events API with their nested sub-markets.
+    ///
+    /// Returns up to `max_pages * 200` events. Each event includes its
+    /// sub-markets (populated via `with_nested_markets=true`).
+    /// This is useful for discovering high-quality binary markets that are
+    /// buried in the flat `/markets` endpoint under short-term sports props.
+    pub async fn list_events(
+        &self,
+        max_pages: usize,
+    ) -> Result<Vec<KalshiEventResponse>, ArbError> {
+        let events = self
+            .client
+            .fetch_all_events(Some("open"), max_pages, true)
+            .await
+            .map_err(ArbError::from)?;
+        Ok(events)
+    }
+
+    /// Extract `Market` objects from events, picking the most liquid sub-market
+    /// per event and using the event title as the question (more matchable).
+    ///
+    /// Returns a Vec of Markets derived from events, ready to merge with
+    /// the flat `/markets` results.
+    pub fn markets_from_events(events: &[KalshiEventResponse]) -> Vec<Market> {
+        let mut markets = Vec::new();
+        for event in events {
+            if event.markets.is_empty() {
+                continue;
+            }
+            // Pick the sub-market with highest volume, or if all zero, the one
+            // closest to 0.50 yes_price (most uncertain = most interesting).
+            let best_sub = event
+                .markets
+                .iter()
+                .filter(|m| m.status == "open" || m.status == "active")
+                .max_by_key(|m| {
+                    // Primary: volume. Secondary: closeness to 50 cents.
+                    let vol = m.volume;
+                    let closeness = 50u32.abs_diff(m.yes_bid.max(m.yes_ask));
+                    // Pack into a single u128 for comparison: volume in high bits, inverted distance in low bits
+                    ((vol as u128) << 32) | ((100 - closeness as u128) & 0xFFFF_FFFF)
+                });
+
+            if let Some(sub) = best_sub {
+                let converted = convert_market_response_with_event_title(
+                    sub.clone(),
+                    &event.title,
+                    &event.event_ticker,
+                );
+                // Only include if prices are valid
+                if arb_types::validate_price(converted.yes_price)
+                    && arb_types::validate_price(converted.no_price)
+                {
+                    markets.push(converted);
+                }
+            }
+        }
+        markets
+    }
 }
 
 #[async_trait]
@@ -41,9 +104,10 @@ impl PredictionMarketConnector for KalshiConnector {
             MarketStatus::Closed => "closed",
             MarketStatus::Settled => "settled",
         };
+        // Use paginated fetch (up to 3 pages of 1000 = 3000 markets max)
         let markets = self
             .client
-            .fetch_markets(None, Some(status_str))
+            .fetch_all_markets(Some(status_str), 3)
             .await
             .map_err(ArbError::from)?;
         Ok(markets
@@ -178,6 +242,23 @@ impl PredictionMarketConnector for KalshiConnector {
 // ---------------------------------------------------------------------------
 // Conversion helpers (Kalshi types <-> arb-types)
 // ---------------------------------------------------------------------------
+
+/// Convert a Kalshi market response to the shared `Market` type, using the
+/// event title as the question (for better matching) and the sub-market ticker
+/// as the platform_id.
+fn convert_market_response_with_event_title(
+    m: KalshiMarketResponse,
+    event_title: &str,
+    _event_ticker: &str,
+) -> Market {
+    // Use the event title as the question — it's more descriptive and matchable
+    // than the sub-market title (which is often just a bracket like ">$100k").
+    let mut market = convert_market_response(m);
+    if !event_title.is_empty() {
+        market.question = event_title.to_string();
+    }
+    market
+}
 
 /// Convert a Kalshi market response to the shared `Market` type.
 /// Prices are converted from cents to Decimal.

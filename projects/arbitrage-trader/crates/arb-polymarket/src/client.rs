@@ -54,8 +54,8 @@ impl PolymarketClient {
             url = format!("{url}&next_cursor={cursor}");
         }
 
-        let resp = self.http.get(&url).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url);
+        let resp = self.send_with_retry(req).await?;
         let markets: Vec<PolyMarketResponse> = resp.json().await?;
         Ok(markets)
     }
@@ -68,8 +68,8 @@ impl PolymarketClient {
         self.rate_limiter.acquire().await;
 
         let url = format!("{}/markets/{}", self.gamma_url, condition_id);
-        let resp = self.http.get(&url).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url);
+        let resp = self.send_with_retry(req).await?;
         let market: PolyMarketResponse = resp.json().await?;
         Ok(market)
     }
@@ -83,8 +83,8 @@ impl PolymarketClient {
 
         let path = format!("/book?token_id={token_id}");
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.http.get(&url).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url);
+        let resp = self.send_with_retry(req).await?;
         let book: PolyBookResponse = resp.json().await?;
         Ok(book)
     }
@@ -95,8 +95,8 @@ impl PolymarketClient {
 
         let path = format!("/price?token_id={token_id}");
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.http.get(&url).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url);
+        let resp = self.send_with_retry(req).await?;
         let price_resp: serde_json::Value = resp.json().await?;
         let price_str = price_resp
             .get("price")
@@ -130,15 +130,13 @@ impl PolymarketClient {
         let auth_headers = self.auth.headers("POST", path, &body_str)?;
 
         let url = format!("{}{}", self.base_url, path);
-        let resp = self
+        let request = self
             .http
             .post(&url)
             .headers(auth_headers)
             .header("Content-Type", "application/json")
-            .body(body_str)
-            .send()
-            .await?;
-        Self::check_response_status(&resp)?;
+            .body(body_str);
+        let resp = self.send_with_retry(request).await?;
         let order_resp: PolyOrderResponse = resp.json().await?;
         Ok(order_resp)
     }
@@ -151,13 +149,8 @@ impl PolymarketClient {
         let auth_headers = self.auth.headers("DELETE", &path, "")?;
 
         let url = format!("{}{}", self.base_url, path);
-        let resp = self
-            .http
-            .delete(&url)
-            .headers(auth_headers)
-            .send()
-            .await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.delete(&url).headers(auth_headers);
+        self.send_with_retry(req).await?;
         Ok(())
     }
 
@@ -169,8 +162,8 @@ impl PolymarketClient {
         let auth_headers = self.auth.headers("GET", path, "")?;
 
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.http.get(&url).headers(auth_headers).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url).headers(auth_headers);
+        let resp = self.send_with_retry(req).await?;
         let orders: Vec<PolyOrderResponse> = resp.json().await?;
         Ok(orders)
     }
@@ -183,8 +176,8 @@ impl PolymarketClient {
         let auth_headers = self.auth.headers("GET", &path, "")?;
 
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.http.get(&url).headers(auth_headers).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url).headers(auth_headers);
+        let resp = self.send_with_retry(req).await?;
         let order: PolyOrderResponse = resp.json().await?;
         Ok(order)
     }
@@ -201,8 +194,8 @@ impl PolymarketClient {
         let auth_headers = self.auth.headers("GET", path, "")?;
 
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.http.get(&url).headers(auth_headers).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url).headers(auth_headers);
+        let resp = self.send_with_retry(req).await?;
         let positions: Vec<PolyPositionResponse> = resp.json().await?;
         Ok(positions)
     }
@@ -215,8 +208,8 @@ impl PolymarketClient {
         let auth_headers = self.auth.headers("GET", path, "")?;
 
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.http.get(&url).headers(auth_headers).send().await?;
-        Self::check_response_status(&resp)?;
+        let req = self.http.get(&url).headers(auth_headers);
+        let resp = self.send_with_retry(req).await?;
         let balance_resp: PolyBalanceResponse = resp.json().await?;
         Ok(balance_resp.balance)
     }
@@ -237,7 +230,57 @@ impl PolymarketClient {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Check HTTP response status and map errors.
+    /// Send a request with automatic 429 retry logic.
+    ///
+    /// If the server returns HTTP 429, reads the `Retry-After` header
+    /// (defaulting to 1 second) and retries up to 3 times.
+    async fn send_with_retry(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, PolymarketError> {
+        let built = request.build()?;
+        let mut attempts = 0u32;
+        let max_retries = 3u32;
+        let mut current_request = built;
+
+        loop {
+            let retry_req = current_request.try_clone();
+
+            let resp = self.http.execute(current_request).await?;
+
+            if resp.status() == 429 {
+                attempts += 1;
+                if attempts > max_retries {
+                    return Err(PolymarketError::RateLimited);
+                }
+
+                let wait_secs: u64 = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+
+                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+
+                current_request = retry_req.ok_or(PolymarketError::RateLimited)?;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                let status_code = resp.status().as_u16();
+                return Err(PolymarketError::Api {
+                    status: status_code,
+                    message: format!("HTTP {}", resp.status()),
+                });
+            }
+
+            return Ok(resp);
+        }
+    }
+
+    /// Check HTTP response status and map errors (kept for future use).
+    #[allow(dead_code)]
     fn check_response_status(resp: &reqwest::Response) -> Result<(), PolymarketError> {
         let status = resp.status();
         if status.is_success() {

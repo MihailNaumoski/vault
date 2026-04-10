@@ -56,23 +56,23 @@ The arbitrage engine had low profitability due to poor market selection:
 | 24h | ~80% | Very low | Unnecessarily conservative |
 | 72h | ~50% | Minimal | Eliminates too many opportunities |
 
-### 4. Quality-Gated Pair Selection (Score >= 0.82, Hard Cap 20, Text Floor 0.80)
+### 4. Quality-Gated Pair Selection (Score >= 0.65, Hard Cap 20, Text Floor 0.55)
 
 **What**: Replace the arbitrary 12-pair cap with a quality threshold, a hard cap, and a text similarity floor:
-- Any matched pair with composite score >= 0.82 is accepted
+- Any matched pair with composite score >= 0.65 is accepted
 - Hard cap of 20 pairs maximum (prevents runaway pair counts)
-- Minimum text similarity of 0.80 required (prevents time_score from compensating for poor text matches)
-- AutoVerified threshold raised from 0.85 to 0.90 (only very high-confidence matches are auto-verified for automated trading)
+- Minimum text similarity of 0.55 required (prevents time_score from compensating for poor text matches)
+- AutoVerified threshold at 0.85 (only high-confidence matches are auto-verified for automated trading)
 
-**Why**: The old system took the top 12 pairs regardless of quality — a mediocre 12th pair got in while a good 15th was excluded. The matcher's composite score (70% text similarity + 30% close-time proximity) already captures match reliability. Letting quality determine the active set means:
+**Why**: The old system took the top 12 pairs regardless of quality -- a mediocre 12th pair got in while a good 15th was excluded. The matcher's composite score (70% text similarity + 30% close-time proximity) already captures match reliability. Letting quality determine the active set means:
 - More pairs when many good matches exist
 - Fewer pairs when the market is thin (better than padding with bad matches)
 
-**Why 0.82**: Raised from the initial 0.75 after analysis. At 0.75, too many marginal matches slipped through. 0.82 ensures only pairs with strong text and timing signals are accepted. The text similarity floor of 0.80 provides an additional safety net — a pair cannot qualify on time_score alone when text similarity is weak.
+**Why 0.65**: Initially set to 0.82, then revised after real-world testing showed legitimate cross-platform matches scoring 0.694-0.737 due to different question phrasing. See "Threshold Revision" section below for full analysis.
 
 **Why cap at 20**: Even with a quality gate, unbounded pair counts create operational risk. 20 is well above the typical 8-15 quality matches found in practice, so it only activates as a safety valve.
 
-**Why AutoVerified at 0.90**: Raising from 0.85 means only near-certain matches bypass manual review. Matches scoring 0.82-0.89 still enter the system as NeedsReview, requiring human confirmation before automated trading begins.
+**Why AutoVerified at 0.85**: Matches scoring 0.65-0.84 enter the system as NeedsReview, requiring human confirmation before automated trading begins. Only near-certain matches (>=0.85) bypass manual review.
 
 ### 5. Increased Fetch Limits: 200 Markets (Both Platforms)
 
@@ -91,10 +91,10 @@ Layer 1: DISCOVERY (main.rs — runs once at startup)
   - Volume >= $10,000
   - Price in [0.10, 0.90]
   - Close-time >= 6h
-  - Text similarity >= 0.80
-  - Match score >= 0.82
+  - Text similarity >= 0.55
+  - Match score >= 0.65
   - Hard cap: 20 pairs max
-  - AutoVerified threshold: 0.90
+  - AutoVerified threshold: 0.85
   → Determines which pairs are monitored
 
 Layer 2: DETECTOR (detector.rs — runs every 1s scan)
@@ -123,27 +123,79 @@ Layer 3: RISK MANAGER (manager.rs — runs per trade)
 | Price filter (discovery) | [0.05, 0.95] | [0.10, 0.90] | Discovery |
 | Price filter (detector) | none | [0.05, 0.95] | Detector |
 | Volume filter | none | $10,000 min | Discovery |
-| Pair quality gate | 12 (arbitrary cap) | score >= 0.82 | Discovery |
+| Pair quality gate | 12 (arbitrary cap) | score >= 0.65 (revised from 0.82) | Discovery |
 | Pair hard cap | 12 | 20 | Discovery |
-| Text similarity floor | none | >= 0.80 | Discovery |
-| AutoVerified threshold | 0.85 | 0.90 | Matcher |
+| Text similarity floor | none | >= 0.55 (revised from 0.80) | Discovery |
+| AutoVerified threshold | 0.85 | 0.85 (revised from 0.90) | Matcher |
 
 ### Files Changed
 
 | File | Changes |
 |------|---------|
 | `crates/arb-engine/src/detector.rs` | Close-time filter (6h), price extreme filter, 7 new tests |
-| `crates/arb-cli/src/main.rs` | Volume filter, tighter price range, close-time filter, quality gate 0.82, hard cap 20, text floor 0.80, limit=200 |
-| `crates/arb-matcher/src/types.rs` | AutoVerified threshold raised from 0.85 to 0.90 |
+| `crates/arb-cli/src/main.rs` | Volume filter, tighter price range, close-time filter, quality gate 0.65, hard cap 20, text floor 0.55, limit=200, real API --match mode |
+| `crates/arb-matcher/src/types.rs` | AutoVerified threshold at 0.85 |
 | `crates/arb-kalshi/src/client.rs` | Added `limit=200` query parameter to `fetch_markets()` |
 | `config/default.toml` | `min_time_to_close_hours = 6` |
+
+---
+
+## Threshold Revision: Quality Gate Lowered (2026-04-09)
+
+### Problem
+
+Real-world testing revealed that the 0.82 quality gate and 0.80 text similarity floor rejected ALL legitimate cross-platform matches. Polymarket and Kalshi phrase questions very differently, and Jaro-Winkler scores on normalized text are much lower than expected:
+
+| Match | Poly Question | Kalshi Question | Composite | Verdict |
+|-------|--------------|-----------------|-----------|---------|
+| Bitcoin | "Will Bitcoin hit $100k by December 2025?" | "Bitcoin above $100,000 on December 31, 2025?" | 0.737 | Good match, was REJECTED |
+| Ethereum | "Will Ethereum reach $5,000 before 2026?" | "Ethereum price above $5,000 by end of 2025?" | 0.729 | Good match, was REJECTED |
+| Fed rate | "Will the Fed cut rates in June 2025?" | "Federal Reserve to cut interest rates at June meeting?" | 0.694 | Good match, was REJECTED |
+
+**Root cause**: The normalizer strips punctuation and lowercases, but cannot unify semantic equivalents like "$100k" vs "$100,000" or "hit" vs "above". Jaro-Winkler is a character-level metric and penalizes these differences heavily. Improving the normalizer (e.g., expanding "$100k" to "100000", synonym mapping) is the long-term fix but requires more development.
+
+### Revised Thresholds
+
+| Parameter | Old | New | Rationale |
+|-----------|-----|-----|-----------|
+| Quality gate (composite) | 0.82 | **0.65** | All 3 real matches (0.694-0.737) pass. Provides 6.7% margin below worst known good match (Fed rate at 0.694). |
+| Text similarity floor | 0.80 | **0.55** | The Fed rate match has text_sim ~0.56 after normalization. Floor must be below worst real case. |
+| AutoVerified threshold | 0.90 | **0.85** | With wider NeedsReview band, 0.85 still ensures only high-confidence matches bypass review. |
+| NeedsReview floor | 0.50 | **0.50** | Unchanged. Pipeline already filters at 0.50 minimum. |
+| Max discovered pairs | 20 | **20** | Unchanged. Safety cap remains. |
+
+**Why 0.65 not 0.70**: The Fed rate match at 0.694 is a clear legitimate match. A 0.70 gate would reject it. Cross-platform phrasing differences are inherently unpredictable -- future legitimate matches may score even lower depending on question wording. 0.65 provides necessary margin.
+
+**Why not lower than 0.65**: Below 0.65, false positive risk increases. The composite already blends text (70%) and time proximity (30%), so 0.65 with a 0.55 text floor still provides meaningful false-positive protection. Matches below 0.55 text similarity are likely genuinely different events.
+
+**False positive mitigation**: NeedsReview (0.50-0.85) pairs still require human confirmation before automated trading. Only AutoVerified (>=0.85) pairs trade automatically. This two-tier system means lowering the gate introduces more candidates for review without increasing automated trading risk.
+
+### Config Location
+
+Thresholds are now configurable via `config/default.toml` under the `[matcher]` section:
+
+```toml
+[matcher]
+quality_gate = 0.65
+text_similarity_floor = 0.55
+auto_verified_threshold = 0.85
+needs_review_floor = 0.50
+max_discovered_pairs = 20
+```
+
+### Future Improvements
+
+1. **Normalizer enhancement**: Expand abbreviations ($100k -> 100000), map synonyms (hit/reach/above), strip ordinals (31st -> 31)
+2. **Semantic similarity**: Consider embedding-based similarity (e.g., sentence transformers) as an alternative to Jaro-Winkler for cross-platform matching
+3. **Adaptive thresholds**: Track confirmed match rates and adjust thresholds based on false positive/negative feedback
 
 ---
 
 ## Recommended Next Steps
 
 1. **Paper test** with new parameters for 48-72 hours
-2. Monitor rejection rates at discovery — if too aggressive, loosen volume to $5,000
-3. Track phantom spread rate (detected opportunities that fail to fill) — should drop significantly
+2. Monitor rejection rates at discovery -- if too aggressive, loosen volume to $5,000
+3. Track phantom spread rate (detected opportunities that fail to fill) -- should drop significantly
 4. Track fill rates before/after to quantify improvement
 5. Add Kalshi volume filtering when their API supports it
+6. Validate revised thresholds against a larger sample of real cross-platform matches

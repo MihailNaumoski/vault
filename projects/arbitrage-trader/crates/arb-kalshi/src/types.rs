@@ -187,6 +187,42 @@ pub struct KalshiBalanceResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Events API response types (GET /events)
+// ---------------------------------------------------------------------------
+
+/// A single event from the Kalshi Events API.
+///
+/// Events group related sub-markets (e.g. "How high will Bitcoin get in 2026?"
+/// contains bracket sub-markets for different price thresholds).
+/// When fetched with `with_nested_markets=true`, the `markets` field is populated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KalshiEventResponse {
+    pub event_ticker: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub mutually_exclusive: bool,
+    /// Sub-markets nested under this event (populated when with_nested_markets=true).
+    #[serde(default)]
+    pub markets: Vec<KalshiMarketResponse>,
+    /// Series ticker this event belongs to.
+    #[serde(default)]
+    pub series_ticker: Option<String>,
+    /// Number of sub-markets under this event.
+    #[serde(default)]
+    pub sub_title: Option<String>,
+}
+
+/// Wrapper for paginated event list responses from GET /events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KalshiEventsListResponse {
+    pub events: Vec<KalshiEventResponse>,
+    pub cursor: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket message types
 // ---------------------------------------------------------------------------
 
@@ -440,5 +476,70 @@ mod tests {
         assert_eq!(envelope.sid, Some(2));
         assert_eq!(envelope.seq, Some(5));
         assert!(envelope.msg.is_some());
+    }
+
+    #[test]
+    fn test_deserialize_event_response() {
+        let json = r#"{
+            "event_ticker": "KXBTCMAX100-26",
+            "title": "When will Bitcoin cross $100k again?",
+            "category": "Crypto",
+            "mutually_exclusive": true,
+            "markets": [
+                {
+                    "ticker": "KXBTCMAX100-26-T1",
+                    "title": "Bitcoin above $100k by April 2026",
+                    "status": "open",
+                    "yes_ask": 65,
+                    "yes_bid": 63,
+                    "no_ask": 37,
+                    "no_bid": 35,
+                    "volume": 5000,
+                    "open_interest": 2000,
+                    "close_time": "2026-04-30T00:00:00Z",
+                    "liquidity": 1000
+                }
+            ]
+        }"#;
+        let event: KalshiEventResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_ticker, "KXBTCMAX100-26");
+        assert_eq!(event.title, "When will Bitcoin cross $100k again?");
+        assert_eq!(event.category, "Crypto");
+        assert!(event.mutually_exclusive);
+        assert_eq!(event.markets.len(), 1);
+        assert_eq!(event.markets[0].ticker, "KXBTCMAX100-26-T1");
+        assert_eq!(event.markets[0].yes_bid, 63);
+    }
+
+    #[test]
+    fn test_deserialize_event_response_no_markets() {
+        let json = r#"{
+            "event_ticker": "KXETHMAXY",
+            "title": "How high will Ethereum get in 2026?",
+            "category": "Crypto",
+            "mutually_exclusive": false
+        }"#;
+        let event: KalshiEventResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_ticker, "KXETHMAXY");
+        assert!(event.markets.is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_events_list_response() {
+        let json = r#"{
+            "events": [
+                {
+                    "event_ticker": "KXBTCMAX100-26",
+                    "title": "When will Bitcoin cross $100k again?",
+                    "category": "Crypto",
+                    "mutually_exclusive": true,
+                    "markets": []
+                }
+            ],
+            "cursor": "abc123"
+        }"#;
+        let list: KalshiEventsListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(list.events.len(), 1);
+        assert_eq!(list.cursor, Some("abc123".to_string()));
     }
 }

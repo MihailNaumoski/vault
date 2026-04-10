@@ -23,8 +23,17 @@ pub struct KalshiRateLimiter {
 impl KalshiRateLimiter {
     /// Create a new dual rate limiter with Kalshi's Basic tier limits.
     pub fn new() -> Self {
-        let write_quota = Quota::per_second(NonZeroU32::new(10).unwrap());
-        let read_quota = Quota::per_second(NonZeroU32::new(20).unwrap());
+        Self::with_limits(20, 10)
+    }
+
+    /// Create a dual rate limiter with custom per-second limits.
+    ///
+    /// Useful for higher-tier Kalshi API plans:
+    /// - Basic: 20 read/s, 10 write/s (default)
+    /// - Pro:   100 read/s, 50 write/s
+    pub fn with_limits(read_per_sec: u32, write_per_sec: u32) -> Self {
+        let write_quota = Quota::per_second(NonZeroU32::new(write_per_sec).unwrap());
+        let read_quota = Quota::per_second(NonZeroU32::new(read_per_sec).unwrap());
         Self {
             write: RateLimiter::direct(write_quota),
             read: RateLimiter::direct(read_quota),

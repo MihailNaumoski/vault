@@ -33,3 +33,4 @@ serde_json = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+sqlx = { workspace = true }
